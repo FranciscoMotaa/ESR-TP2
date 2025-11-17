@@ -8,7 +8,7 @@ from collections import defaultdict
 
 PORT = 5555 # Porta do Bootstrapper
 DEFAULT_OVERLAY_PORT = 6000 # Porta padrão para nós que ainda não se registaram
-CONF_FILE = 'bootstrp_conf.json'
+CONF_FILE = 'bootstrap_conf.json'
 
 ACTIVE_NODES = {} # {node_id: {'ip': ip, 'port': port}} -> Mapa DINÂMICO de nós ativos
 NODE_NEIGHBORS = {} # {node_id: [neighbor_ip1, neighbor_ip2, ...]} -> Mapa ESTÁTICO de vizinhos

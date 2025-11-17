@@ -74,10 +74,10 @@
   },
 {
     "id": "C6",
-    "neigbors":[
+    "neighbors":[
       "10.0.17.1"
 ]
-}
+},
   {
     "id": "C2",
     "neighbors": [

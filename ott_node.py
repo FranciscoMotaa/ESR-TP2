@@ -3,13 +3,13 @@
 import socket
 import threading
 import time
-import json  # Para falar com o bootstrapper
-import sys   # Para ler os argumentos de linha de comando
+import json
+import sys
+import heapq
 
-# Endereço do nosso "porteiro" (o bootstrapper do overlay)
-BOOTSTRAPPER_ADDR = ('10.0.10.1', 5555)# ATUALIZADO: Este é o 'overlay_bootstrapper.py'
-                                        # E não o 'bootstrap_inicio.py' (que usa TCP)
-                                        # Vamos manter a lógica UDP que tínhamos discutido
+# --- CONFIGURAÇÃO ---
+# Endereço do Bootstrapper (R3)
+BOOTSTRAPPER_ADDR = ('10.0.10.1', 5555) 
 
 class OTTNode:
     
@@ -19,36 +19,33 @@ class OTTNode:
         self.host_port = host_port
         
         # O socket UDP principal para toda a comunicação
-        # (Usamos o mesmo socket para Enviar e Ouvir)
+        # '0.0.0.0' permite receber pacotes em qualquer interface
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", self.host_port))
         
         print(f"[{self.node_name}] Nó a correr em {self.host_ip}:{self.host_port}")
 
-        # --- TAREFA: A TABELA DE VIZINHOS ---
+        # --- ESTRUTURAS DE DADOS ---
         self.tabela_vizinhos = {}
         self.lock_tabela = threading.Lock()
+
+        self.fluxos = {}
+        self.lock_fluxos = threading.Lock()
         
-        # --- FIM DA TAREFA ---
-        
-        self.running = True # Usado para parar as threads
+        self.running = True
 
     def contactar_bootstrapper(self):
         """
-        Versão TCP para ser compatível com o novo bootstrap_inicio.py
+        Regista-se no Bootstrapper via TCP e obtém a lista inicial de vizinhos.
         """
         print(f"[{self.node_name}] A contactar Bootstrapper (TCP) em {BOOTSTRAPPER_ADDR}...")
         
-        # Cria um socket TCP temporário apenas para o registo
         sock_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
         try:
             sock_tcp.settimeout(5.0)
-            sock_tcp.connect(BOOTSTRAPPER_ADDR) # Conecta ao servidor
+            sock_tcp.connect(BOOTSTRAPPER_ADDR)
             
-            # Prepara a mensagem JSON como o servidor espera:
-            # {'id': 'C2', 'ip': '10.0.19.1', 'port': 5000}
-            # (Nota: enviamos a nossa porta UDP para os outros nos contactarem depois)
             mensagem = {
                 'id': self.node_name,
                 'ip': self.host_ip,
@@ -57,7 +54,6 @@ class OTTNode:
             
             sock_tcp.sendall(json.dumps(mensagem).encode('utf-8'))
             
-            # Espera pela resposta
             data = sock_tcp.recv(4096)
             resposta = json.loads(data.decode('utf-8'))
             
@@ -67,10 +63,8 @@ class OTTNode:
                 
                 current_time = time.time()
                 
-                # Preenche a tabela com a lista recebida
                 with self.lock_tabela:
                     for vizinho in lista_vizinhos:
-                        # A lista vem como [{'id': 'R1', 'ip': '...', 'port': ...}, ...]
                         nome = vizinho['id']
                         ip = vizinho['ip']
                         porta = vizinho['port']
@@ -89,57 +83,135 @@ class OTTNode:
             print(f"[{self.node_name}] ERRO fatal ao contactar bootstrapper: {e}")
             return False
         finally:
-            sock_tcp.close() # Fecha a conexão TCP
+            sock_tcp.close()
 
-    # --- INÍCIO DA NOVA LÓGICA DE HEARTBEAT ---
+    # --- LÓGICA DE REDE (UDP) ---
 
     def processar_pacote(self, data, addr):
         """
-        O "Dispatcher"  dispatcher. 
-        Esta função é chamada pelo Ouvinte (Thread 2)
+        Dispatcher principal para pacotes UDP recebidos.
         """
         try:
             mensagem = data.decode()
             
-            # É uma mensagem de Heartbeat?
             if mensagem.startswith("HEARTBEAT_FROM"):
                 partes = mensagem.split(" ")
                 if len(partes) == 2:
                     nome_vizinho = partes[1]
                     self.processar_heartbeat_recebido(nome_vizinho, addr)
             
-            # elif mensagem.startswith("JOIN"):
-            #     # Futuramente, aqui processamos os pedidos de stream
-            #     pass
+            elif mensagem.startswith("JOIN"):
+                # 1. Ler os dados
+                partes = mensagem.split(" ")
+                stream_id = partes[1]
+                
+                # 2. Registar QUEM pediu (Downstream)
+                with self.lock_tabela:
+                    # Procura quem tem este IP
+                    vizinho_nome = None
+                    for nome, dados in self.tabela_vizinhos.items():
+                        if dados['addr'] == addr:
+                            vizinho_nome = nome
+                            break
+                
+                if vizinho_nome:
+                    print(f"[{self.node_name}] 📝 Registando pedido de {vizinho_nome} para stream {stream_id}")
+
+                    with self.lock_fluxos:
+                        if stream_id not in self.fluxos:
+                            self.fluxos[stream_id] = {'upstream': None, 'downstream': [], 'active': False}
+                        
+                        if vizinho_nome not in self.fluxos[stream_id]['downstream']:
+                            self.fluxos[stream_id]['downstream'].append(vizinho_nome)
+
+                        if self.node_name.startswith("STREAMER"):
+                            print(f"[{self.node_name}] 🎬 CLIENTE DETETADO! A iniciar transmissão do {stream_id}...")
+                            threading.Thread(target=self.thread_enviar_stream_fake, args=(stream_id,)).start()
+
+                    # 3. REENCAMINHAR (A Estafeta 🏃‍♂️)
+                    # Se eu não sou o Streamer, tenho de pedir a alguém!
+                    if not self.node_name.startswith("STREAMER"):
+                        print(f"[{self.node_name}] 🔄 Reencaminhando pedido para cima...")
+                        # Chamamos a mesma função de envio!
+                        # Como a lista simulada tem ['C6', 'R1', 'R3'...]
+                        # O R1 vai ver que o próximo é o R3 e envia para lá automatically.
+                        self.enviar_pedido_join(stream_id)
+                else:
+                    print(f"[{self.node_name}] Recebi JOIN de desconhecido: {addr}")
+
+
+            elif mensagem.startswith("STREAM"):
+                        # --- NOVA LÓGICA DE DADOS ---
+                        # Formato: "STREAM S1 <dados...>"
+                        # Cuidado: O payload pode ser binário (vídeo), o decode() pode falhar se for vídeo real.
+                        # Por agora, vamos assumir texto/simulação.
+                        partes = mensagem.split(" ", 2) # Divide só nos primeiros 2 espaços
+                        if len(partes) >= 2:
+                            stream_id = partes[1]
+                            conteudo = partes[2] if len(partes) > 2 else ""
+                            
+                            self.reencaminhar_dados(stream_id, data)
                 
         except UnicodeDecodeError:
-            pass # Ignora pacotes que não são texto (ex: futuro stream)
+            pass 
         except Exception as e:
             print(f"[{self.node_name}] Erro a processar pacote: {e}")
 
+    def construir_grafo_da_rede(self):
+        """
+        Lê o JSON e constrói um grafo onde chaves e valores são IDs (Nomes).
+        Resolve o problema de traduzir IPs para Nomes.
+        """
+        grafo = {}
+        ip_para_nome = {}
+
+        try:
+            # 1. Ler o ficheiro
+            with open('bootstrap_conf.json', 'r') as f:
+                dados = json.load(f)
+            
+            lista_nos = dados.get("nodes", [])
+
+            # 2. Primeira Passagem: Criar um mapa de tradução IP -> Nome
+            #    (Precisamos disto porque a lista de vizinhos usa IPs)
+            for no in lista_nos:
+                # Vamos assumir que o IP principal do nó é o primeiro IP da lista de vizinhos
+                # ou, idealmente, o JSON deveria ter um campo "ip".
+                # COMO O TEU JSON NÃO TEM O PRÓPRIO IP EXPLICITO, 
+                # vamos ter de usar uma lógica de detetive ou alterar o JSON.
+                
+                # --- SOLUÇÃO DE CONTORNO ---
+                # Vamos assumir que conseguimos deduzir quem é quem.
+                # Mas o ideal era o teu JSON ter: "id": "R1", "ip": "10.0.1.1"
+                pass 
+                
+            # ⚠️ PAUSA: O teu JSON atual torna isto difícil.
+            # Ele diz: "R3 tem vizinhos [10.0.10.2, 10.0.8.1]"
+            # Mas não diz explicitamente qual é o IP do R3.
+            
+        except Exception as e:
+            print(f"Erro grafo: {e}")
+            return {}
+    
     def processar_heartbeat_recebido(self, nome_vizinho, addr):
         """
-        TAREFA: Atualiza a tabela de forma INTELIGENTE.
-        Se o IP já existir com outro nome, atualiza o nome.
+        Atualiza a tabela e corrige nomes se necessário (IP -> Nome).
         """
         current_time = time.time()
         
         with self.lock_tabela:
-            # 1. Procura se já temos este IP registado com um nome diferente (ex: o IP antigo)
+            # 1. Verificar se este IP já existe com outro nome (ex: IP antigo do bootstrapper)
             nome_antigo_para_remover = None
             
             for nome_existente, dados in self.tabela_vizinhos.items():
-                # Se o IP e Porta forem iguais... mas o nome for diferente
                 if dados['addr'] == addr and nome_existente != nome_vizinho:
                     nome_antigo_para_remover = nome_existente
                     break
             
-            # 2. Se encontrámos um nome antigo para este IP, removemo-lo!
             if nome_antigo_para_remover:
                 print(f"[{self.node_name}] 🔄 Atualização de Identidade: {nome_antigo_para_remover} mudou para {nome_vizinho}")
                 self.tabela_vizinhos.pop(nome_antigo_para_remover)
 
-            # 3. Atualiza (ou cria) a entrada com o nome correto
             if nome_vizinho not in self.tabela_vizinhos:
                  print(f"[{self.node_name}] Novo vizinho detetado via Heartbeat: {nome_vizinho}")
 
@@ -148,45 +220,55 @@ class OTTNode:
                 'last_heartbeat': current_time
             }
 
+
+    def reencaminhar_dados(self, stream_id, pacote_bruto):
+        """
+        Recebe dados de stream e reencaminha para todos os interessados (downstream).
+        """
+        # Se eu sou o destino final (Cliente)
+        if self.node_name.startswith("C"):
+            print(f"[{self.node_name}] 📺 A REPRODUZIR: Recebi dados do {stream_id} ({len(pacote_bruto)} bytes)")
+            return
+
+        # Se eu sou Router/Server, reencaminho
+        with self.lock_fluxos:
+            if stream_id in self.fluxos:
+                destinos = self.fluxos[stream_id]['downstream']
+                if destinos:
+                    #print(f"[{self.node_name}] ⏩ Reencaminhando dados para {destinos}")
+                    with self.lock_tabela:
+                        for destino_nome in destinos:
+                            if destino_nome in self.tabela_vizinhos:
+                                addr = self.tabela_vizinhos[destino_nome]['addr']
+                                self.sock.sendto(pacote_bruto, addr)
+
+
+    # --- THREADS (TRABALHADORES) ---
+
     def thread_ouvir_pacotes(self):
-        """
-        Trabalhador 2 (Ouvinte 🎧). 
-        Fica sempre à escuta de pacotes UDP.
-        """
+        """Trabalhador 2 (Ouvinte)."""
         print(f"[{self.node_name}] THREAD: Ouvinte iniciado.")
         while self.running:
             try:
-                # Esta linha "bloqueia" ⏸️ até um pacote chegar
                 data, addr = self.sock.recvfrom(2048) 
-                
-                # Assim que chega, envia-o para o "dispatcher"
                 if self.running:
                     self.processar_pacote(data, addr)
-                    
             except socket.timeout:
-                continue # Ignora timeouts, volta a ouvir
+                continue 
             except Exception as e:
                 if self.running:
                     print(f"[{self.node_name}] Erro no Ouvinte: {e}")
 
     def thread_enviar_heartbeats(self):
-        """
-        Trabalhador 1 (Emissor ❤️). 
-        Envia heartbeats a todos os vizinhos a cada 5s.
-        """
+        """Trabalhador 1 (Emissor). Envia a cada 5s."""
         print(f"[{self.node_name}] THREAD: Emissor de Heartbeats iniciado.")
-        
         while self.running:
-            time.sleep(5) # Espera 5 segundos
-            
+            time.sleep(5)
             mensagem = f"HEARTBEAT_FROM {self.node_name}".encode()
             
-            # Usa o "cadeado" 🔐 para LER a tabela
             with self.lock_tabela:
-                # Faz uma cópia da lista de endereços para enviar
                 lista_de_enderecos = [dados['addr'] for dados in self.tabela_vizinhos.values()]
 
-            # Envia para todos (fora do "lock" para não bloquear a tabela)
             for addr in lista_de_enderecos:
                 try:
                     self.sock.sendto(mensagem, addr)
@@ -194,87 +276,157 @@ class OTTNode:
                     print(f"[{self.node_name}] Erro ao enviar HB para {addr}: {e}")
 
     def thread_verificar_vizinhos(self):
-        """
-        Trabalhador 3 (Verificador 🕵️‍♂️). 
-        Corre periodicamente para remover vizinhos "mortos" a cada 20s.
-        """
+        """Trabalhador 3 (Verificador). Remove mortos a cada 20s."""
         print(f"[{self.node_name}] THREAD: Verificador de Vizinhos iniciado.")
-        
-        # Os teus valores:
-        CHECK_INTERVAL = 20   # Acorda e verifica a cada 20s
-        TIMEOUT_DURATION = 20 # Se passaram 20s sem heartbeat, considera morto
+        CHECK_INTERVAL = 20   
+        TIMEOUT_DURATION = 20 
         
         while self.running:
-            
-            # 1. Espera o tempo definido antes da próxima verificação
             time.sleep(CHECK_INTERVAL) 
-            
-            # (Opcional: print de debug para saberes que ele está vivo)
-            # print(f"[{self.node_name}] Verificador: A verificar tabela...")
-            
             current_time = time.time()
             vizinhos_mortos = [] 
             
-            # -------------------------------------------------------
-            # FASE 1: DETEÇÃO (Apenas Leitura)
-            # -------------------------------------------------------
             with self.lock_tabela:
-                # Percorre a tabela para encontrar quem está "velho demais"
                 for nome_vizinho, dados_vizinho in self.tabela_vizinhos.items():
                     older = dados_vizinho['last_heartbeat']
-                    
-                    # A tua comparação lógica:
                     if (current_time - older) >= TIMEOUT_DURATION:
                         vizinhos_mortos.append(nome_vizinho)
             
-            # -------------------------------------------------------
-            # FASE 2: REMOÇÃO (Apenas Escrita)
-            # -------------------------------------------------------
-            # Só entramos aqui se encontrámos alguém morto na Fase 1
             if vizinhos_mortos:
                 print(f"[{self.node_name}] ALERTA 💀: Vizinhos considerados mortos: {vizinhos_mortos}")
-                
-                # Precisamos de adquirir o "cadeado" novamente para APAGAR
                 with self.lock_tabela:
                     for nome in vizinhos_mortos:
-                        # .pop(chave, None) remove a chave se ela existir
                         self.tabela_vizinhos.pop(nome, None)
 
+    def thread_menu_cliente(self):
+        """Trabalhador 4 (Interface). Apenas para Clientes."""
+        print(f"[{self.node_name}] THREAD: Menu iniciado.")
+        time.sleep(2) 
+
+        while self.running:
+            print("\nOptions:")
+            print("1 - List available streams")
+            print("2 - Start a stream")
+            print("3 - Stop current stream")
+            print("4 - Exit")
+            
+            try:
+                choice = input(f"({self.node_name}) Choose an option: ")
+                
+                if choice == '1':
+                    print("TODO: Listar streams conhecidos")
+                elif choice == '2':
+                    stream_id = input("Qual o ID da stream? (ex: S1): ")
+                    self.enviar_pedido_join(stream_id)
+                elif choice == '3':
+                    print("TODO: Parar stream")
+                elif choice == '4':
+                    print("A sair...")
+                    self.stop()
+                    break
+            except ValueError:
+                pass
+            except Exception as e:
+                print(f"Erro no menu: {e}")
+
+    def thread_enviar_stream_fake(self, stream_id):
+        """
+        Simula o envio de um vídeo (envia pacotes numerados).
+        """
+        seq = 1
+        print(f"[{self.node_name}] 🚀 INICIANDO STREAM {stream_id}")
         
-    # --- FIM DA NOVA LÓGICA DE HEARTBEAT ---
+        while self.running:
+            # Verifica se ainda tenho alguém a quem enviar
+            tem_clientes = False
+            with self.lock_fluxos:
+                if stream_id in self.fluxos and self.fluxos[stream_id]['downstream']:
+                    tem_clientes = True
+            
+            if not tem_clientes:
+                print(f"[{self.node_name}] ⏸️ Sem clientes. A pausar stream.")
+                break
+
+            # Cria o pacote de dados
+            dados = f"Frame_{seq}".ljust(100, '.') # Cria uma string com 100 chars
+            mensagem = f"STREAM {stream_id} {dados}".encode()
+            
+            # Envia para os vizinhos diretos interessados (ex: R7)
+            self.reencaminhar_dados(stream_id, mensagem)
+            
+            seq += 1
+            time.sleep(0.1) # 10 Frames por segundo (Simulação)
+
+
+    # --- SIMULAÇÃO DE ROTEAMENTO ---
+
+    def enviar_pedido_join(self, stream_id):
+        """
+        SIMULAÇÃO: Envia JOIN para o próximo salto usando caminho fixo.
+        Caminho: C6 -> R1 -> R3 -> R7 -> S1
+        """
+        caminho_simulado = ['C6', 'R1', 'R3', 'R7', 'STREAMER1']
+        
+        print(f"[{self.node_name}] A simular rota: {caminho_simulado}")
+
+        if self.node_name not in caminho_simulado:
+            print("Erro: Eu não estou neste caminho simulado!")
+            return
+            
+        meu_index = caminho_simulado.index(self.node_name)
+        
+        if meu_index == len(caminho_simulado) - 1:
+            print("Eu sou o destino final (Streamer).")
+            return
+
+        proximo_salto = caminho_simulado[meu_index + 1]
+        
+        endereco_vizinho = None
+        with self.lock_tabela:
+            if proximo_salto in self.tabela_vizinhos:
+                endereco_vizinho = self.tabela_vizinhos[proximo_salto]['addr']
+            else:
+                print(f"[{self.node_name}] ❌ ERRO: Vizinho '{proximo_salto}' não encontrado! (R1 está ligado?)")
+                print(f"Vizinhos conhecidos: {list(self.tabela_vizinhos.keys())}")
+                return
+
+        try:
+            msg = f"JOIN {stream_id}".encode()
+            self.sock.sendto(msg, endereco_vizinho)
+            print(f"[{self.node_name}] 📤 JOIN enviado para {proximo_salto} ({endereco_vizinho})")
+        except Exception as e:
+            print(f"[{self.node_name}] Erro no envio: {e}")
+
+    # --- CONTROLO PRINCIPAL ---
 
     def start(self):
-        """
-        Arranca o nó e (AGORA) inicia as threads de trabalho.
-        """
-        
         if not self.contactar_bootstrapper():
             print(f"[{self.node_name}] A encerrar. Não foi possível contactar o bootstrapper.")
             return
 
         print(f"[{self.node_name}] A iniciar threads de trabalho...")
 
-        # "Contrata" o Trabalhador 1 (Emissor)
+        # Iniciar Trabalhadores
         t_enviar = threading.Thread(target=self.thread_enviar_heartbeats)
-        t_enviar.daemon = True # Morre com o programa principal
+        t_enviar.daemon = True 
         t_enviar.start()
 
-        # "Contrata" o Trabalhador 2 (Ouvinte)
         t_ouvir = threading.Thread(target=self.thread_ouvir_pacotes)
         t_ouvir.daemon = True
         t_ouvir.start()
 
-        
-        # "Contrata" o Trabalhador 3 (Verificador 🕵️‍♂️)
         t_verificar = threading.Thread(target=self.thread_verificar_vizinhos)
         t_verificar.daemon = True
         t_verificar.start()
-        # --- FIM DA NOVA LINHA ---
+
+        # Só mostra o menu se o nome começar por "C"
+        if self.node_name.startswith("C"): 
+            t_menu = threading.Thread(target=self.thread_menu_cliente)
+            t_menu.daemon = True
+            t_menu.start()
 
         print(f"[{self.node_name}] Nó operacional. A correr.")
         
-        # A thread principal pode agora sair, ou fazer outras coisas
-        # (Vamos mantê-la viva para apanhar o Ctrl+C)
         try:
             while True:
                 time.sleep(1)
@@ -286,10 +438,8 @@ class OTTNode:
         self.running = False
         self.sock.close()
 
-
-# --- Bloco Principal de Execução (Sem alterações) ---
+# --- EXECUÇÃO ---
 if __name__ == "__main__":
-    
     if len(sys.argv) != 4:
         print("Uso: python3 ott_node.py <meu_nome> <meu_ip> <minha_porta>")
         sys.exit(1)

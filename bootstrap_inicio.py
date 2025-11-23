@@ -2,156 +2,107 @@ import os
 import socket
 import json
 import threading
-import sys
-from collections import defaultdict
 
-
-PORT = 5555 # Porta do Bootstrapper
-DEFAULT_OVERLAY_PORT = 6000 # Porta padrão para nós que ainda não se registaram
+PORT = 5555
+DEFAULT_OVERLAY_PORT = 6000 # Mantém a mesma porta que usas nos nós!
 CONF_FILE = 'bootstrap_conf.json'
 
-ACTIVE_NODES = {} # {node_id: {'ip': ip, 'port': port}} -> Mapa DINÂMICO de nós ativos
-NODE_NEIGHBORS = {} # {node_id: [neighbor_ip1, neighbor_ip2, ...]} -> Mapa ESTÁTICO de vizinhos
-
+# Mapeamento Global Estático: ID -> Dados do Nó (IP, Vizinhos)
+# Exemplo: { "R1": {"ip": "10.0.17.1", "neighbors": ["R3", "R4"]} }
+TOPOLOGIA = {}
 
 def load_config():
     """
-    Carrega a configuração da rede.
-    Cria apenas o mapa estático ID -> IPs Vizinhos.
+    Carrega o JSON e indexa TUDO por ID para acesso rápido.
     """
-    global NODE_NEIGHBORS
-    
+    global TOPOLOGIA
     try:
         if not os.path.exists(CONF_FILE):
-             print(f"[ERROR] O ficheiro de configuração '{CONF_FILE}' não foi encontrado.")
+             print(f"[ERRO] Ficheiro '{CONF_FILE}' não encontrado.")
              return False
 
-        with open(CONF_FILE, 'r') as f: # Abre o ficheiro 'bootstrp_conf'
-            config_data = json.load(f) # Carrega o JSON do ficheiro
+        with open(CONF_FILE, 'r') as f:
+            data = json.load(f)
         
-        nodes = config_data.get("nodes", [])
-        
-        for node in nodes:
-            node_id = node["id"]
-            neighbor_ips = node.get("neighbors", [])
+        # Converte a lista num Dicionário para pesquisas rápidas
+        for node in data.get("nodes", []):
+            TOPOLOGIA[node["id"]] = {
+                "ip": node["ip"],
+                "neighbors": node["neighbors"]
+            }
             
-            # Mapeia ID -> IPs dos Vizinhos (Única informação estática fiável)
-            NODE_NEIGHBORS[node_id] = neighbor_ips
-
-        # *** A lógica de criação do IP_TO_ID foi removida ***
-        
-        print(f"[CONFIG] Configuração estática carregada para {len(NODE_NEIGHBORS)} nós.")
+        print(f"[CONFIG] Topologia carregada: {len(TOPOLOGIA)} nós conhecidos.")
         return True
-
-    except json.JSONDecodeError:
-        print(f"[ERROR] O ficheiro '{CONF_FILE}' contém JSON inválido.")
-        return False
     except Exception as e:
-        print(f"[ERROR] Erro ao carregar ou processar o ficheiro de configuração: {e}")
+        print(f"[ERRO] Falha ao carregar JSON: {e}")
         return False
-    
 
-def handle_client(client_socket, client_address):
+def handle_client(conn, addr):
     """
-    Lida com a conexão TCP de um nó overlay que se está a registar.
-    
-    O nó que se regista DEVE enviar o seu ID, IP (para onde o podem contactar) e PORTA.
+    Responde ao nó com a lista de vizinhos baseada no JSON estático.
+    Não precisamos de saber se o vizinho está 'ativo' ou não. O nó que tente contactá-lo.
     """
     try:
-        # Recebe a mensagem de registo do nó
-        data = client_socket.recv(4096)
+        # Recebe pedido (ex: {'id': 'C2', ...})
+        data = conn.recv(4096)
         if not data: return
+        
+        msg = json.loads(data.decode())
+        node_id = msg.get('id')
+        
+        print(f"[REGISTO] Nó '{node_id}' conectou-se de {addr}")
 
-        # Assume que o nó envia {'id': 'R3', 'ip': '10.0.10.1', 'port': 6000}
-        reg_info = json.loads(data.decode('utf-8'))
-        
-        node_id = reg_info.get('id')
-        node_ip = reg_info.get('ip', client_address[0]) # Usa o IP do socket como fallback
-        node_port = reg_info.get('port', DEFAULT_OVERLAY_PORT)
-        
-        if not node_id:
-            print("[ERROR] Registo inválido: falta o ID do nó.")
-            return
+        response_neighbors = []
 
-        # 1. Registo do Nó (Aprende o IP/Porta do nó que se regista)
-        ACTIVE_NODES[node_id] = {'ip': node_ip, 'port': node_port}
-        print(f"[BOOTSTRAP] Nó registrado: {node_id} @ {node_ip}:{node_port}")
+        # 1. Verificar se conhecemos este nó na topologia
+        if node_id in TOPOLOGIA:
+            # 2. Obter a lista de IDs dos vizinhos (ex: ["R9"])
+            lista_vizinhos_ids = TOPOLOGIA[node_id]["neighbors"]
+            
+            # 3. Traduzir IDs para IPs usando a TOPOLOGIA carregada
+            for viz_id in lista_vizinhos_ids:
+                if viz_id in TOPOLOGIA:
+                    viz_dados = TOPOLOGIA[viz_id]
+                    response_neighbors.append({
+                        "id": viz_id,
+                        "ip": viz_dados["ip"], # O IP correto que está no JSON
+                        "port": DEFAULT_OVERLAY_PORT # Assume porta fixa
+                    })
+                else:
+                    print(f"[AVISO] Vizinho '{viz_id}' referenciado por '{node_id}' não existe no JSON!")
 
-        # 2. Obtém os IPs dos vizinhos (Lista estática do JSON)
-        neighbor_ips = NODE_NEIGHBORS.get(node_id, []) 
-        # 3. Constrói a lista de vizinhos a devolver
-        neighbors_to_send = []
-        for n_ip in neighbor_ips:
-            # Assumimos que o IP listado no JSON (n_ip) é o IP de contacto do vizinho.
-            
-            neighbor_is_active = False
-            found_neighbor_id = n_ip # ID padrão: o IP (Se não for encontrado)
-            n_data = {'ip': n_ip, 'port': DEFAULT_OVERLAY_PORT}
-            
-            # Pesquisa por correspondência de IP em todos os nós ativos
-            for active_id, active_info in ACTIVE_NODES.items():
-                if active_info['ip'] == n_ip:
-                    # Caso A: Vizinho encontrado e está ativo
-                    found_neighbor_id = active_id
-                    n_data = active_info
-                    neighbor_is_active = True
-                    break
-            
-            if neighbor_is_active:
-                # Se o vizinho está ativo, devolvemos os dados de registo
-                neighbors_to_send.append({
-                    'id': found_neighbor_id,
-                    'ip': n_data['ip'],
-                    'port': n_data['port'] 
-                })
-            else:
-                # Caso B: Vizinho inativo. Não podemos saber o seu ID real, 
-                # mas devolvemos o IP de contacto (n_ip) e o ID (assumido) é o próprio IP.
-                neighbors_to_send.append({
-                    'id': n_ip, # O nó que se regista terá de tentar conectar-se com este IP.
-                    'ip': n_ip, 
-                    'port': DEFAULT_OVERLAY_PORT 
-                })
-        
-        # 4. Envia a resposta TCP ao nó que se está a registar
-        response = {'status': 'OK', 'neighbors': neighbors_to_send}
-        client_socket.sendall(json.dumps(response).encode('utf-8'))
-        
-    except json.JSONDecodeError:
-        response = {'status': 'ERROR', 'message': 'JSON inválido.'}
-        client_socket.sendall(json.dumps(response).encode('utf-8'))
+            # Envia resposta OK
+            msg_resp = {'status': 'OK', 'neighbors': response_neighbors}
+        else:
+            # Nó desconhecido no JSON
+            print(f"[ERRO] Nó '{node_id}' não consta na configuração estática.")
+            msg_resp = {'status': 'ERRO', 'neighbors': []}
+
+        conn.sendall(json.dumps(msg_resp).encode('utf-8'))
+
     except Exception as e:
-        print(f"[ERROR] Erro no manuseamento do cliente: {e}")
+        print(f"[ERRO] Thread cliente: {e}")
     finally:
-        client_socket.close()
-
-
-
-
-#iniciar o servidor  eiode
+        conn.close()
 
 def start_server():
-    """Inicia o servidor TCP de bootstrap."""
-    if not load_config(): 
-        print("Impossível carregar a configuração. Servidor não iniciado.")
-        return
+    if not load_config(): return
         
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Importante para reiniciar rápido sem erro "Address already in use"
+    
     try:
-        # Liga a 0.0.0.0 para aceitar conexões em qualquer interface
-        server_socket.bind(("0.0.0.0", PORT)) 
-        server_socket.listen()
-        print(f"Bootstrapper iniciado e a escutar na porta {PORT}...")
+        server.bind(("0.0.0.0", PORT))
+        server.listen(5)
+        print(f"Bootstrapper ON na porta {PORT}...")
 
         while True:
-            client_socket, client_address = server_socket.accept()
-            # Inicia uma thread para lidar com cada novo nó
-            threading.Thread(target=handle_client, args=(client_socket, client_address)).start()
+            client, addr = server.accept()
+            threading.Thread(target=handle_client, args=(client, addr)).start()
     except Exception as e:
-        print(f"Erro fatal no servidor: {e}")
+        print(f"[FATAL] {e}")
     finally:
-        server_socket.close()
+        server.close()
 
 if __name__ == '__main__':
     start_server()
-

@@ -1,4 +1,4 @@
-# ott_node.py - VERSÃO FINAL COM FLOOD E LATÊNCIA
+# ott_node.py - VERSÃO FINAL (FLOOD PURO + Latência)
 
 import socket
 import threading
@@ -7,7 +7,6 @@ import json
 import sys
 
 # --- CONFIGURAÇÃO ---
-# Endereço do Bootstrapper (R3) - Tem de bater certo com o IP onde corres o bootstrapper.py
 BOOTSTRAPPER_ADDR = ('10.0.10.1', 5555) 
 
 class OTTNode:
@@ -17,28 +16,30 @@ class OTTNode:
         self.host_ip = host_ip
         self.host_port = int(host_port)
         
-        # O socket UDP principal para toda a comunicação
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", self.host_port))
         
         print(f"[{self.node_name}] Nó a correr em {self.host_ip}:{self.host_port}")
 
-        # --- ESTRUTURAS DE DADOS ---
         # Tabela de Vizinhos: { 'R1': {'addr': (ip, port), 'latencia': 10.0, 'last_seen': time} }
         self.tabela_vizinhos = {}
         self.lock_tabela = threading.Lock()
 
-        # Tabela de Rotas (Preenchida pelo FLOOD): { 'STREAM1': {'proximo_salto': 'R1', 'custo': 50.0} }
+        # Tabela de Rotas (Preenchida pelo FLOOD)
+        # { 'STREAMER1': {'proximo_salto': 'R1', 'custo': 50.0} }
         self.tabela_rotas = {}
         self.lock_rotas = threading.Lock()
 
-        # Gestão de Fluxos (Quem pediu o quê): { 'STREAM1': {'downstream': ['C1', 'R2']} }
+        # Gestão de Fluxos
         self.fluxos = {}
         self.lock_fluxos = threading.Lock()
         
+        # Base de dados para evitar loops de Flood
+        self.lsa_database = {} 
+        
         self.running = True
 
-    # --- REGISTO INICIAL (TCP) ---
+    # --- BOOTSTRAPPER (TCP) ---
     def contactar_bootstrapper(self):
         print(f"[{self.node_name}] A contactar Bootstrapper (TCP) em {BOOTSTRAPPER_ADDR}...")
         sock_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -55,215 +56,221 @@ class OTTNode:
             if resposta.get('status') == 'OK':
                 lista_vizinhos = resposta.get('neighbors', [])
                 print(f"[{self.node_name}] Registo OK! Vizinhos recebidos: {len(lista_vizinhos)}")
+                
                 current_time = time.time()
                 with self.lock_tabela:
                     for vizinho in lista_vizinhos:
+                        # CORREÇÃO AQUI: Garantir que 'last_heartbeat' e 'latencia' existem!
                         self.tabela_vizinhos[vizinho['id']] = {
                             'addr': (vizinho['ip'], int(vizinho['port'])),
-                            'latencia': 10.0, # Valor default conservador (10ms)
-                            'last_seen': current_time
+                            'latencia': 10.0,
+                            'last_heartbeat': current_time  # <--- ESTA CHAVE ERA A QUE FALTAVA/ESTAVA ERRADA
                         }
                 return True
             else:
                 print(f"[{self.node_name}] Erro registo: {resposta.get('message')}")
                 return False
+
         except Exception as e:
-            print(f"[{self.node_name}] ERRO fatal Bootstrapper: {e}")
+            print(f"[{self.node_name}] ERRO fatal ao contactar bootstrapper: {e}")
             return False
         finally:
             sock_tcp.close()
 
-    # --- PROCESSAMENTO DE PACOTES (UDP) ---
+    # --- PROCESSAMENTO DE PACOTES ---
     def processar_pacote(self, data, addr):
         try:
             mensagem = data.decode()
             
-            # 1. PING (Medição de Latência)
-            if mensagem.startswith("PING"):
-                # Msg: PING <origem> <seq> <timestamp_envio>
-                _, origem, seq, ts_envio = mensagem.split()
-                # Responde imediatamente com PONG, devolvendo o timestamp original
-                resp = f"PONG {self.node_name} {ts_envio}".encode()
-                self.sock.sendto(resp, addr)
+            if mensagem.startswith("HEARTBEAT_FROM"):
+                self.processar_heartbeat(mensagem.split(" ")[1], addr)
 
-            # 2. PONG (Resposta da Medição)
-            elif mensagem.startswith("PONG"):
-                # Msg: PONG <origem> <timestamp_original>
-                _, origem, ts_envio_str = mensagem.split()
-                # Calcula RTT e Latência (RTT / 2)
-                rtt = (time.time() - float(ts_envio_str)) * 1000 # Em ms
-                latencia = rtt / 2
-                
-                with self.lock_tabela:
-                    if origem in self.tabela_vizinhos:
-                        # Atualiza endereço se mudou
-                        self.tabela_vizinhos[origem]['addr'] = addr
-                        self.tabela_vizinhos[origem]['last_seen'] = time.time()
-                        # Média móvel para suavizar a latência
-                        antiga = self.tabela_vizinhos[origem]['latencia']
-                        self.tabela_vizinhos[origem]['latencia'] = (antiga * 0.7) + (latencia * 0.3)
-
-            # 3. FLOOD (Descoberta de Rotas)
+            # --- LÓGICA DE FLOOD (Descobrir o Caminho) ---
             elif mensagem.startswith("FLOOD"):
-                # Msg: FLOOD <stream_id> <custo_acumulado> <sender_id>
-                _, stream_id, custo_remoto_str, sender_id = mensagem.split()
-                custo_remoto = float(custo_remoto_str)
-
-                # Descobrir latência do link de onde veio
-                latencia_link = 999.0
-                with self.lock_tabela:
-                    if sender_id in self.tabela_vizinhos:
-                        latencia_link = self.tabela_vizinhos[sender_id]['latencia']
-                        self.tabela_vizinhos[sender_id]['last_seen'] = time.time() # Refresh vizinho
-
-                novo_custo_total = custo_remoto + latencia_link
+                # Msg: FLOOD <origem_stream> <custo> <seq>
+                # Ex: FLOOD STREAMER1 20 5
+                _, origem_stream, custo_str, seq_str = mensagem.split()
+                custo_remoto = float(custo_str)
+                seq = int(seq_str)
                 
-                melhorou = False
-                with self.lock_rotas:
-                    rota_atual = self.tabela_rotas.get(stream_id)
-                    # Se rota não existe OU nova rota é mais rápida (menor latência)
-                    if rota_atual is None or novo_custo_total < rota_atual['custo']:
-                        self.tabela_rotas[stream_id] = {
-                            'proximo_salto': sender_id,
-                            'custo': novo_custo_total,
-                            'addr_vizinho': addr # Guarda IP para enviar JOIN depois
-                        }
-                        melhorou = True
-                        print(f"[{self.node_name}] 🗺️ Rota '{stream_id}' via {sender_id} (Lat: {novo_custo_total:.1f}ms)")
-
-                # Se melhorou, inunda os vizinhos (Split Horizon)
-                if melhorou:
-                    msg_flood = f"FLOOD {stream_id} {novo_custo_total} {self.node_name}".encode()
-                    with self.lock_tabela:
-                        for viz_nome, viz_dados in self.tabela_vizinhos.items():
-                            if viz_nome != sender_id:
-                                try: self.sock.sendto(msg_flood, viz_dados['addr'])
-                                except: pass
-
-            # 4. JOIN (Adesão à Stream)
-            elif mensagem.startswith("JOIN"):
-                # Msg: JOIN <stream_id>
-                partes = mensagem.split(" ")
-                stream_id = partes[1]
+                # 1. Verificar se é informação nova (Sequence Number)
+                is_new = False
+                with self.lock_rotas: # Usamos lock_rotas para proteger a DB de LSAs
+                    last_seq = self.lsa_database.get(origem_stream, -1)
+                    if seq > last_seq:
+                        self.lsa_database[origem_stream] = seq
+                        is_new = True
                 
-                # Descobrir quem enviou
-                vizinho_nome = None
-                with self.lock_tabela:
-                    for nome, dados in self.tabela_vizinhos.items():
-                        if dados['addr'] == addr:
-                            vizinho_nome = nome
-                            break
-                
-                if vizinho_nome:
-                    print(f"[{self.node_name}] 📝 Pedido JOIN de {vizinho_nome} para {stream_id}")
+                if is_new:
+                    # 2. Descobrir quem me enviou isto (será o meu próximo salto)
+                    vizinho_remetente = self.obter_nome_vizinho_por_ip(addr)
                     
-                    # Adiciona à lista downstream
-                    with self.lock_fluxos:
-                        if stream_id not in self.fluxos:
-                            self.fluxos[stream_id] = {'downstream': []}
-                        if vizinho_nome not in self.fluxos[stream_id]['downstream']:
-                            self.fluxos[stream_id]['downstream'].append(vizinho_nome)
+                    if vizinho_remetente:
+                        # Custo = Custo que veio + Latência do link
+                        latencia_link = 10.0 
+                        with self.lock_tabela:
+                            if vizinho_remetente in self.tabela_vizinhos:
+                                latencia_link = self.tabela_vizinhos[vizinho_remetente].get('latencia', 10.0)
 
-                    # Se sou a FONTE, começo a enviar. Se não, peço para cima.
-                    if self.node_name == stream_id:
-                        print(f"[{self.node_name}] 🎬 SOU A FONTE! Cliente ligado.")
-                    else:
-                        self.enviar_pedido_join_upstream(stream_id)
+                        novo_custo = custo_remoto + latencia_link
+                        
+                        # 3. Atualizar Tabela de Rotas se for melhor caminho
+                        melhorou = False
+                        with self.lock_rotas:
+                            rota_atual = self.tabela_rotas.get(origem_stream)
+                            if rota_atual is None or novo_custo < rota_atual['custo']:
+                                self.tabela_rotas[origem_stream] = {
+                                    'proximo_salto': vizinho_remetente,
+                                    'custo': novo_custo
+                                }
+                                melhorou = True
+                                print(f"[{self.node_name}] 🗺️ Rota Flood: Para '{origem_stream}' ir por '{vizinho_remetente}' (Custo {novo_custo:.1f})")
+                        
+                        # 4. Reencaminhar para vizinhos (se for melhor ou novo)
+                        if melhorou:
+                            msg_flood = f"FLOOD {origem_stream} {novo_custo} {seq}".encode()
+                            self.inundar_vizinhos(msg_flood, ignore_ip=addr)
 
-            # 5. STREAM (Dados de Vídeo)
+            elif mensagem.startswith("JOIN"):
+                self.tratar_join(mensagem, addr)
+
             elif mensagem.startswith("STREAM"):
                 partes = mensagem.split(" ", 2)
                 if len(partes) >= 2:
-                    stream_id = partes[1]
-                    self.reencaminhar_dados(stream_id, data)
+                    self.reencaminhar_dados(partes[1], data)
 
-        except Exception as e:
-            # print(f"Erro processar: {e}") # Debug ruidoso
-            pass
+        except Exception: pass
 
-    # --- LÓGICA DE ENVIO ---
+    # --- AUXILIARES ---
+    def obter_nome_vizinho_por_ip(self, addr):
+        with self.lock_tabela:
+            for nome, dados in self.tabela_vizinhos.items():
+                if dados['addr'] == addr: return nome
+        return None
+
+    def processar_heartbeat(self, nome_vizinho, addr):
+        now = time.time()
+        with self.lock_tabela:
+            antigo = next((n for n, d in self.tabela_vizinhos.items() if d['addr'] == addr and n != nome_vizinho), None)
+            if antigo:
+                print(f"[{self.node_name}] 🔄 Identidade: {antigo} -> {nome_vizinho}")
+                self.tabela_vizinhos.pop(antigo)
+            
+            if nome_vizinho not in self.tabela_vizinhos:
+                print(f"[{self.node_name}] Novo vizinho: {nome_vizinho}")
+
+            self.tabela_vizinhos[nome_vizinho] = {'addr': addr, 'latencia': 10.0, 'last_heartbeat': now}
+
+    def inundar_vizinhos(self, mensagem, ignore_ip=None):
+        with self.lock_tabela:
+            for dados in self.tabela_vizinhos.values():
+                if dados['addr'] != ignore_ip:
+                    try: self.sock.sendto(mensagem, dados['addr'])
+                    except: pass
+
+    # --- LÓGICA DE JOIN (USANDO TABELA DE ROTAS DO FLOOD) ---
     
-    def enviar_pedido_join_upstream(self, stream_id):
-        """Olha para a tabela de rotas e envia JOIN para o melhor vizinho."""
-        target_info = None
-        with self.lock_rotas:
-            if stream_id in self.tabela_rotas:
-                target_info = self.tabela_rotas[stream_id]
+    def tratar_join(self, msg, addr):
+        stream_id = msg.split(" ")[1]
+        quem_pediu = self.obter_nome_vizinho_por_ip(addr)
         
-        if target_info:
-            proximo_nome = target_info['proximo_salto']
+        if quem_pediu:
+            print(f"[{self.node_name}] 📝 Pedido de {quem_pediu} para {stream_id}")
+            try: self.sock.sendto(f"ACK_JOIN {stream_id}".encode(), addr)
+            except: pass
             
-            addr_lista = target_info.get('addr_vizinho')
+            with self.lock_fluxos:
+                if stream_id not in self.fluxos:
+                    self.fluxos[stream_id] = {'downstream': []}
+                if quem_pediu not in self.fluxos[stream_id]['downstream']:
+                    self.fluxos[stream_id]['downstream'].append(quem_pediu)
             
-            if addr_lista:
-                addr = tuple(addr_lista) # Converter lista [ip, port] para tuplo (ip, port)
-                print(f"[{self.node_name}] ⬆️ Enviando JOIN {stream_id} para {proximo_nome} ({addr})")
-                
-                try:
-                    self.sock.sendto(f"JOIN {stream_id}".encode(), addr)
-                except Exception as e:
-                    print(f"[{self.node_name}] ❌ Erro socket: {e}")
+            if self.node_name == stream_id:
+                print(f"[{self.node_name}] 🎬 SOU A FONTE! A iniciar...")
+                threading.Thread(target=self.thread_video, args=(stream_id,)).start()
             else:
-                # Fallback antigo (só se não houver endereço na rota)
-                print(f"[{self.node_name}] ⚠️ Rota sem endereço. A tentar tabela de vizinhos...")
-                with self.lock_tabela:
-                    if proximo_nome in self.tabela_vizinhos:
-                        addr = self.tabela_vizinhos[proximo_nome]['addr']
-                        self.sock.sendto(f"JOIN {stream_id}".encode(), addr)
-                    else:
-                        print(f"[{self.node_name}] ❌ Erro: Não consigo contactar {proximo_nome}.")
+                # Reencaminhar para cima (Recursivo)
+                threading.Thread(target=self.enviar_pedido_join_via_flood, args=(stream_id,)).start()
 
-        else:
-            print(f"[{self.node_name}] ❌ Erro: Não tenho rota para {stream_id}. Aguardando FLOOD...")
-
-    def reencaminhar_dados(self, stream_id, pacote_bruto):
-        """Se for cliente, reproduz. Se for router, reencaminha."""
-        if self.node_name.startswith("C"):
-            # Simula reprodução
-            # print(f"[{self.node_name}] 📺 Frame recebido stream {stream_id}")
-            sys.stdout.write(".") # Efeito visual de loading
-            sys.stdout.flush()
+    def enviar_pedido_join_via_flood(self, stream_id):
+        """
+        Consulta a tabela de rotas (criada pelo Flood) e envia o JOIN.
+        """
+        proximo = None
+        with self.lock_rotas:
+            rota = self.tabela_rotas.get(stream_id)
+            if rota:
+                proximo = rota['proximo_salto']
+        
+        if not proximo:
+            print(f"[{self.node_name}] ❌ Sem rota Flood para {stream_id}. Aguarde anúncio...")
             return
 
+        # Obter endereço
+        addr_prox = None
+        with self.lock_tabela:
+            if proximo in self.tabela_vizinhos:
+                addr_prox = self.tabela_vizinhos[proximo]['addr']
+        
+        if not addr_prox:
+            print(f"[{self.node_name}] ❌ Rota existe ({proximo}), mas vizinho não está vivo.")
+            return
+
+        # Envio com Fiabilidade (Stop-and-Wait)
+        self.sock.settimeout(2.0)
+        for i in range(3):
+            try:
+                print(f"[{self.node_name}] 📤 JOIN para {proximo} ({i+1}/3)...")
+                self.sock.sendto(f"JOIN {stream_id}".encode(), addr_prox)
+                d, _ = self.sock.recvfrom(1024)
+                if f"ACK_JOIN {stream_id}" in d.decode():
+                    print(f"[{self.node_name}] ✅ ACK recebido!")
+                    self.sock.settimeout(None)
+                    return
+            except socket.timeout:
+                pass
+            except: pass
+        
+        self.sock.settimeout(None)
+        print(f"[{self.node_name}] ❌ Falha ao contactar {proximo}")
+
+    def reencaminhar_dados(self, stream_id, pacote):
+        if self.node_name.startswith("C"):
+            sys.stdout.write(".")
+            sys.stdout.flush()
+            return
+        
         with self.lock_fluxos:
             if stream_id in self.fluxos:
                 for dest in self.fluxos[stream_id]['downstream']:
                     with self.lock_tabela:
                         if dest in self.tabela_vizinhos:
-                            try: self.sock.sendto(pacote_bruto, self.tabela_vizinhos[dest]['addr'])
+                            try: self.sock.sendto(pacote, self.tabela_vizinhos[dest]['addr'])
                             except: pass
 
     # --- THREADS ---
-
-    def thread_medir_latencia(self):
-        """Envia PINGs periodicamente para atualizar custos."""
-        seq = 0
+    
+    def thread_video(self, stream_id):
+        seq = 1
         while self.running:
-            time.sleep(2) # A cada 2 segundos
+            with self.lock_fluxos:
+                if not self.fluxos.get(stream_id, {}).get('downstream'):
+                    break # Pára se não houver clientes
+            dados = f"Frame_{seq}".ljust(100, '.')
+            self.reencaminhar_dados(stream_id, f"STREAM {stream_id} {dados}".encode())
             seq += 1
-            ts = time.time()
-            msg = f"PING {self.node_name} {seq} {ts}".encode()
-            
-            with self.lock_tabela:
-                # Copia para lista para não bloquear
-                addrs = [d['addr'] for d in self.tabela_vizinhos.values()]
-            
-            for addr in addrs:
-                try: self.sock.sendto(msg, addr)
-                except: pass
+            time.sleep(0.1)
 
     def thread_servidor_anunciar(self):
-        """APENAS PARA O SERVIDOR: Inicia o FLOOD."""
-        stream_id = self.node_name # Assumindo que o nome do servidor é o ID da stream (ex: STREAMER1)
-        print(f"[{self.node_name}] 📢 Thread de Anúncio FLOOD iniciada.")
+        """SERVIDORES: Enviam FLOOD para anunciar existência."""
+        stream_id = self.node_name
+        seq = 0
         while self.running:
-            # Envia FLOOD com custo 0 para todos os vizinhos
-            msg = f"FLOOD {stream_id} 0 {self.node_name}".encode()
-            with self.lock_tabela:
-                for d in self.tabela_vizinhos.values():
-                    try: self.sock.sendto(msg, d['addr'])
-                    except: pass
-            time.sleep(5) # Anuncia a cada 5s
+            time.sleep(10)
+            seq += 1
+            msg = f"FLOOD {stream_id} 0 {seq}".encode() # Custo inicial 0
+            self.inundar_vizinhos(msg)
+            print(f"[{self.node_name}] 📢 Anúncio Flood enviado (Seq {seq})")
 
     def thread_ouvir(self):
         while self.running:
@@ -272,62 +279,65 @@ class OTTNode:
                 self.processar_pacote(data, addr)
             except: pass
 
-    def thread_gerar_video(self):
-        """APENAS PARA O SERVIDOR: Gera frames."""
-        seq = 1
-        stream_id = self.node_name
+    def thread_heartbeat(self):
         while self.running:
-            tem_clientes = False
-            with self.lock_fluxos:
-                if stream_id in self.fluxos and self.fluxos[stream_id]['downstream']:
-                    tem_clientes = True
-            
-            if tem_clientes:
-                payload = f"Frame_{seq}".ljust(100, '.')
-                msg = f"STREAM {stream_id} {payload}".encode()
-                self.reencaminhar_dados(stream_id, msg)
-                seq += 1
-            time.sleep(0.1) # 10 FPS
+            time.sleep(5)
+            with self.lock_tabela:
+                addrs = [d['addr'] for d in self.tabela_vizinhos.values()]
+            for addr in addrs:
+                try: self.sock.sendto(f"HEARTBEAT_FROM {self.node_name}".encode(), addr)
+                except: pass
+
+    def thread_verificador(self):
+        while self.running:
+            time.sleep(10)
+            now = time.time()
+            mortos = []
+            with self.lock_tabela:
+                for nome, dados in self.tabela_vizinhos.items():
+                    if now - dados['last_heartbeat'] > 20: mortos.append(nome)
+            if mortos:
+                print(f"[{self.node_name}] 💀 Mortos: {mortos}")
+                with self.lock_tabela:
+                    for n in mortos: self.tabela_vizinhos.pop(n, None)
 
     def thread_menu(self):
-        time.sleep(1)
+        time.sleep(2)
         while self.running:
-            print(f"\n[{self.node_name}] 1.Pedir Stream | 2.Ver Rotas | 3.Sair")
-            op = input("> ")
-            if op == '1':
-                target = input("ID Stream (ex: STREAMER1): ")
-                self.enviar_pedido_join_upstream(target)
-            elif op == '2':
-                with self.lock_rotas:
-                    print(json.dumps(self.tabela_rotas, indent=2))
-            elif op == '3':
-                self.stop()
-                break
+            try:
+                print(f"\n[{self.node_name}] 1.Pedir Stream | 2.Ver Rotas Flood | 3.Sair")
+                op = input("> ")
+                if op == '1':
+                    target = input("ID Stream (ex: STREAMER1): ")
+                    threading.Thread(target=self.enviar_pedido_join_via_flood, args=(target,)).start()
+                elif op == '2':
+                    with self.lock_rotas: print(json.dumps(self.tabela_rotas, indent=2))
+                elif op == '3':
+                    self.stop()
+                    break
+            except: pass
 
     def start(self):
         if not self.contactar_bootstrapper(): return
-
-        # Threads comuns a todos
+        
         threading.Thread(target=self.thread_ouvir, daemon=True).start()
-        threading.Thread(target=self.thread_medir_latencia, daemon=True).start()
-
-        # Threads Específicas
+        threading.Thread(target=self.thread_heartbeat, daemon=True).start()
+        threading.Thread(target=self.thread_verificador, daemon=True).start()
+        
         if self.node_name.startswith("STREAMER"):
             threading.Thread(target=self.thread_servidor_anunciar, daemon=True).start()
-            threading.Thread(target=self.thread_gerar_video, daemon=True).start()
         
         if self.node_name.startswith("C"):
             threading.Thread(target=self.thread_menu, daemon=True).start()
-
-        print(f"[{self.node_name}] Operacional.")
+            
+        print(f"[{self.node_name}] A correr.")
         try:
-            while self.running: time.sleep(1)
+            while True: time.sleep(1)
         except: self.stop()
 
     def stop(self):
         self.running = False
         self.sock.close()
-        print("Bye.")
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:

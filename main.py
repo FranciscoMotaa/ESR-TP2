@@ -6,12 +6,10 @@ import argparse
 import time
 import base64
 import math
-import threading
-import os
 from utils import get_interface_ip
 from overlay_structs import OverlayNode, MsgType, MAX_PACKET_SIZE
 
-# Tentar importar Tkinter para visualização (Pode falhar em headless)
+# Tentar importar Tkinter para visualização
 try:
     import tkinter as tk
     from tkinter import Label
@@ -20,9 +18,10 @@ except ImportError:
     HAS_GUI = False
 
 DEFAULT_PORT = 50000
-VIDEO_FILE = "movie.Mjpeg"  # O ficheiro que o prof recomendou
+BOOTSTRAP_PORT = 6000
+VIDEO_FILE = "movie.Mjpeg" 
 
-# --- CLASSE PARA LER O VÍDEO DO DISCO ---
+# --- CLASSES DE VÍDEO (Iguais ao anterior) ---
 class VideoStream:
     def __init__(self, filename):
         self.filename = filename
@@ -35,22 +34,18 @@ class VideoStream:
         self.frame_num = 0
 
     def next_frame(self):
-        """Lê o próximo frame JPEG do ficheiro MJPEG (formato específico)"""
         if not self.file: return None
         try:
-            # Ler o tamanho do frame (5 bytes string numérico)
             data = self.file.read(5)
             if not data: 
-                self.file.seek(0) # Loop video
+                self.file.seek(0) 
                 data = self.file.read(5)
-            
             framelength = int(data)
             data = self.file.read(framelength)
             self.frame_num += 1
             return data
         except: return None
 
-# --- CLASSE PARA MOSTRAR O VÍDEO (GUI) ---
 class VideoGUI:
     def __init__(self, root, title):
         self.root = root
@@ -61,47 +56,76 @@ class VideoGUI:
 
     def update_image(self, data_bytes):
         try:
-            # Tkinter suporta GIF/PPM nativamente. Para JPEG precisa de PIL.
-            # Tente instalar 'python3-pil.imagetk' se der erro.
-            # Aqui usamos uma conversão básica ou raw data se suportado.
             image = tk.PhotoImage(data=data_bytes) 
             self.label.configure(image=image)
             self.label.image = image
             self.root.update()
         except Exception as e:
-            # Fallback para debug se não tiver PIL instalado para JPEGs
             pass
 
-def load_config(file_path, node_id):
+# --- NOVA FUNÇÃO: OBTER VIZINHOS DO TRACKER ---
+def get_neighbors_dynamic(tracker_ip, my_id, my_ip):
+    """
+    Conecta ao Tracker via TCP e pede uma lista de vizinhos.
+    """
+    print(f"[*] A contactar Tracker em {tracker_ip}:{BOOTSTRAP_PORT}...")
     try:
-        with open(file_path, 'r') as f:
-            config = json.load(f)
-        for node in config.get("nodes", []):
-            if node["id"] == node_id: return node
-        return None
-    except: return None
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3.0) # Timeout de 3 segundos
+        sock.connect((tracker_ip, BOOTSTRAP_PORT))
+        
+        # Enviar pedido
+        request = json.dumps({"id": my_id, "ip": my_ip})
+        sock.send(request.encode('utf-8'))
+        
+        # Receber resposta
+        data = sock.recv(4096)
+        response = json.loads(data.decode('utf-8'))
+        
+        sock.close()
+        
+        if response.get("status") == "OK":
+            neighbors = response.get("neighbors", [])
+            print(f"[*] Tracker respondeu. Vizinhos atribuídos: {neighbors}")
+            return neighbors
+        else:
+            print("[!] Tracker recusou registo.")
+            return []
+            
+    except Exception as e:
+        print(f"[ERRO CRÍTICO] Falha ao contactar Tracker: {e}")
+        print(" -> Verifique se o bootstrapper.py está a correr e se o IP está certo.")
+        sys.exit(1)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('node_id')
-    parser.add_argument('--config', default='bootstrap_conf.json') 
+    # Novo argumento: IP do Tracker (obrigatório para modo dinâmico)
+    parser.add_argument('--tracker', help='IP do servidor de Bootstrapping (Tracker)', required=True)
     args = parser.parse_args()
 
     my_ip = get_interface_ip()
     print(f"[*] Nó {args.node_id} ({my_ip}) a iniciar...")
 
-    node_config = load_config(args.config, args.node_id)
+    # 1. SETUP DINÂMICO
+    # Em vez de ler JSON, perguntamos ao Tracker
+    initial_neighbors = get_neighbors_dynamic(args.tracker, args.node_id, my_ip)
+    
     node = OverlayNode(args.node_id, my_ip, DEFAULT_PORT)
     
-    if node_config:
-        for neighbor_ip in node_config.get("neighbors", []):
-            node.neighbors[neighbor_ip] = {'metric': 50.0, 'last_seen': 0}
+    # Adicionar os vizinhos que o Tracker devolveu
+    for neighbor_ip in initial_neighbors:
+        node.neighbors[neighbor_ip] = {'metric': 50.0, 'last_seen': 0}
+
+    # Se a lista vier vazia (sou o primeiro nó), fico à espera que outros se liguem a mim
+    if not initial_neighbors:
+        print("[*] Sou o primeiro nó (ou o Tracker deu lista vazia). À espera de conexões...")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('0.0.0.0', DEFAULT_PORT))
     sock.setblocking(0)
 
-    # --- SETUP VÍDEO ---
+    # --- RESTO DO CÓDIGO IGUAL AO ANTERIOR ---
     video_stream = None
     gui = None
     
@@ -116,33 +140,27 @@ def main():
         except:
             print("[GUI] Falha ao iniciar janela gráfica.")
 
-    # --- ESTADO DE REMONTAGEM (CLIENTE) ---
-    # buffer[frame_id] = { chunk_index: data_b64 }
     reassembly_buffer = {} 
-
-    # --- TIMERS ---
     last_hello = 0
     last_flood = 0
     last_frame = 0
     
     HELLO_INTERVAL = 1.0 
     FLOOD_INTERVAL = 10.0 
-    FRAME_INTERVAL = 0.05 # 20 FPS (Tentar ser rápido)
-    
-    # Tamanho seguro para payload (deixar espaço para cabeçalhos JSON e UDP)
+    FRAME_INTERVAL = 0.05 
     CHUNK_SIZE = 1024 
 
     inputs = [sock, sys.stdin]
     is_streamer = "STREAMER" in args.node_id
     frame_seq = 0
 
-    print("[*] Loop principal iniciado. Ctrl+C para sair.")
+    print("[*] Loop Overlay iniciado. Ctrl+C para sair.")
     
     try:
         while True:
             now = time.time()
             
-            # --- A. Enviar Hellos ---
+            # --- A. Hellos ---
             if now - last_hello >= HELLO_INTERVAL:
                 for n_ip in node.neighbors:
                     pkt = node.pack_message(MsgType.HELLO, n_ip, b"")
@@ -157,53 +175,44 @@ def main():
                     "cost": 0,
                     "origin_seq": int(now)
                 }).encode('utf-8')
-                
                 print(f"[📢] A iniciar Flood para {args.node_id}")
+                # Enviar para quem conhecemos
                 for n_ip in node.neighbors:
                     pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload)
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
                 last_flood = now
 
-            # --- C. GERAR E FRAGMENTAR VÍDEO (SÓ STREAMER) ---
+            # --- C. Vídeo ---
             if is_streamer and video_stream and now - last_frame >= FRAME_INTERVAL:
                 if args.node_id in node.routing_table:
                     clients = node.routing_table[args.node_id].downstream_ips
                     if clients:
-                        # 1. Ler bytes do disco
                         raw_bytes = video_stream.next_frame()
-                        
                         if raw_bytes:
                             frame_seq += 1
-                            # 2. Codificar para Base64 (para ir dentro do JSON)
                             b64_data = base64.b64encode(raw_bytes).decode('utf-8')
                             total_len = len(b64_data)
-                            
-                            # 3. Calcular fragmentos
                             num_chunks = math.ceil(total_len / CHUNK_SIZE)
                             
-                            # 4. Enviar Fragmentos
                             for i in range(num_chunks):
                                 start = i * CHUNK_SIZE
                                 end = start + CHUNK_SIZE
                                 chunk_data = b64_data[start:end]
-                                
                                 payload = json.dumps({
                                     "id": args.node_id,
-                                    "fid": frame_seq,      # ID do Frame
-                                    "cid": i,              # ID do Chunk
-                                    "tot": num_chunks,     # Total Chunks
+                                    "fid": frame_seq,
+                                    "cid": i,
+                                    "tot": num_chunks,
                                     "data": chunk_data
                                 }).encode('utf-8')
 
                                 for client_ip in clients:
                                     pkt = node.pack_message(MsgType.STREAM_DATA, client_ip, payload)
                                     sock.sendto(pkt, (client_ip, DEFAULT_PORT))
-                            
-                            # print(f"[🎥] Frame {frame_seq} enviado em {num_chunks} pedaços.")
                 last_frame = now
 
             # --- EVENT LOOP ---
-            readable, _, _ = select.select(inputs, [], [], 0.01) # Ultra rápido para vídeo
+            readable, _, _ = select.select(inputs, [], [], 0.01)
             
             for s in readable:
                 if s is sock:
@@ -211,6 +220,14 @@ def main():
                         data, addr = sock.recvfrom(MAX_PACKET_SIZE)
                         sender_ip_real = addr[0]
                         
+                        # --- DETEÇÃO PASSIVA DE VIZINHOS ---
+                        # Importante no modo dinâmico: Se alguém me manda HELLO, 
+                        # eu adiciono-o como vizinho mesmo que o Tracker não mo tenha dito.
+                        if sender_ip_real not in node.neighbors:
+                            print(f"[AUTO-DISCOVERY] Novo vizinho detetado passivamente: {sender_ip_real}")
+                            node.neighbors[sender_ip_real] = {'metric': 50.0, 'last_seen': 0}
+                        # -----------------------------------
+
                         header, payload = node.unpack_message(data)
                         if not header: continue
 
@@ -238,10 +255,7 @@ def main():
                                 print(f"[⬆️] Reencaminhando JOIN para {upstream_ip}")
 
                         elif header['type'] == MsgType.STREAM_LEAVE:
-                            # Processar o LEAVE
                             upstream_to_prune = node.handle_leave(payload, sender_ip_real)
-                            
-                            # Se o nó disser que precisa de fazer Pruning, reencaminha para cima
                             if upstream_to_prune and upstream_to_prune != "SOURCE":
                                 pkt = node.pack_message(MsgType.STREAM_LEAVE, upstream_to_prune, payload)
                                 sock.sendto(pkt, (upstream_to_prune, DEFAULT_PORT))
@@ -252,50 +266,31 @@ def main():
                                 stream_info = json.loads(payload.decode('utf-8'))
                                 s_id = stream_info.get('id')
                                 
-                                # --- LÓGICA DE CLIENTE: REMONTAGEM ---
                                 if "C" in args.node_id:
                                     fid = stream_info.get('fid')
                                     cid = stream_info.get('cid')
                                     tot = stream_info.get('tot')
                                     chunk_data = stream_info.get('data')
 
-                                    # Inicializar buffer para este frame se não existir
                                     if fid not in reassembly_buffer:
                                         reassembly_buffer[fid] = {}
-                                    
-                                    # Guardar pedaço
                                     reassembly_buffer[fid][cid] = chunk_data
 
-                                    # Verificar se temos o frame completo
                                     if len(reassembly_buffer[fid]) == tot:
-                                        # Reconstruir string base64 completa
                                         full_b64 = "".join([reassembly_buffer[fid][i] for i in range(tot)])
-                                        
-                                        # Descodificar para bytes
                                         img_bytes = base64.b64decode(full_b64)
-                                        
                                         print(f"[📺] Frame {fid} COMPLETO ({len(img_bytes)} bytes)!")
-                                        
-                                        # Mostrar na GUI
-                                        if gui:
-                                            gui.update_image(img_bytes)
-                                        
-                                        # Limpar buffer (memória)
+                                        if gui: gui.update_image(img_bytes)
                                         del reassembly_buffer[fid]
-                                        # Limpar frames muito velhos para não encher RAM
                                         old_frames = [k for k in reassembly_buffer.keys() if k < fid - 5]
                                         for k in old_frames: del reassembly_buffer[k]
                                 
-                                # --- LÓGICA DE ROUTER: FORWARDING ---
                                 if s_id in node.routing_table:
                                     for child in node.routing_table[s_id].downstream_ips:
                                         if child != sender_ip_real:
-                                            # Forwarding direto do pacote fragmentado
                                             pkt = node.pack_message(MsgType.STREAM_DATA, child, payload)
                                             sock.sendto(pkt, (child, DEFAULT_PORT))
-                            except Exception as e: 
-                                # print(f"Erro processamento frame: {e}")
-                                pass
+                            except Exception as e: pass
 
                     except Exception as e:
                         print(f"[ERRO] {e}")
@@ -303,7 +298,7 @@ def main():
                 elif s is sys.stdin:
                     cmd = sys.stdin.readline().strip()
                     if cmd == "status":
-                        print(f"Vizinhos (RTT): {node.neighbors}")
+                        print(f"Vizinhos: {node.neighbors}")
                         print(f"Rotas: {node.routing_table}")
                     elif cmd.startswith("join"):
                         parts = cmd.split()
@@ -317,7 +312,6 @@ def main():
                                 print(f"[🔌] Pedido JOIN enviado para {next_hop}")
                             else:
                                 print("[!] Rota desconhecida. Espere pelo Flood.")
-                                
                     elif cmd.startswith("leave"):
                         parts = cmd.split()
                         if len(parts) > 1:
@@ -328,10 +322,7 @@ def main():
                                 pkt = node.pack_message(MsgType.STREAM_LEAVE, next_hop, payload)
                                 sock.sendto(pkt, (next_hop, DEFAULT_PORT))
                                 print(f"[✂️] Pedido LEAVE enviado para {next_hop}")
-                                # Limpar buffer local se eu for cliente
-                                if "C" in args.node_id:
-                                    reassembly_buffer.clear()
-                                    print("[INFO] Buffer de vídeo limpo.")
+                                if "C" in args.node_id: reassembly_buffer.clear()
 
     except KeyboardInterrupt:
         print("A sair...")

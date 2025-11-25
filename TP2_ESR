@@ -806,7 +806,7 @@ link l37 {
 canvas c1 {
     name {Canvas1}
     refpt {0 0 47.5791667 -122.132322 2.0}
-    scale 150.0
+    scale {150.0}
     size {2000 1000}
 }
 

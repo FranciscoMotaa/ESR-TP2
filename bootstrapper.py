@@ -44,8 +44,8 @@ def handle_client(client_sock, addr):
                 # Se houver poucos, devolve todos. Se houver muitos, escolhe 2.
                 k = min(len(candidates), 2)
                 selected = random.sample(candidates, k)
-                # devolver ip:port se disponível
-                response_neighbors = [n.get('address', n.get('ip')) for n in selected]
+                # devolver apenas o IP (main.py assume vizinhos como IP simples)
+                response_neighbors = [n.get('ip') for n in selected]
             
             # 3. Adicionar este novo nó à lista (para os próximos o encontrarem)
             # Evitar duplicados (atualizar se já existe)

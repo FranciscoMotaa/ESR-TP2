@@ -6,18 +6,18 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Set, Optional
 
 # --- CONSTANTES ---
-MAX_PACKET_SIZE = 4096
-HEADER_FORMAT = "!B16s16sI d" # Type, SrcIP, DstIP, Seq, Timestamp
+MAX_PACKET_SIZE = 4096 
+HEADER_FORMAT = "!B 16s 16s I d" # Type, SrcIP, DstIP, Seq, Timestamp
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 class MsgType(Enum):
-    HELLO = 1
-    ROUTEDISCOVERY = 2  # Flood (LSA)
-    ROUTEREPLY = 3      # Reservado
-    STREAMJOIN = 4      # Cliente pede stream
-    STREAMDATA = 5      # Dados do video
-    HELLORESPONSE = 6   # Para medir RTT (Pong)
-    STREAMLEAVE = 7     # Para parar o stream
+    HELLO = 1            
+    ROUTE_DISCOVERY = 2  # Flood (LSA)
+    ROUTE_REPLY = 3      # Reservado
+    STREAM_JOIN = 4      # Cliente pede stream
+    STREAM_DATA = 5      # Dados do video
+    HELLO_RESPONSE = 6   #  Para medir RTT (Pong)
+    STREAM_LEAVE = 7     # Para parar o stream
     DEBUG = 99
 
 @dataclass
@@ -185,3 +185,18 @@ class OverlayNode:
 
 # Compatibilidade: exportar nome esperado por `main.py`
 MAXPACKETSIZE = MAX_PACKET_SIZE
+
+# Backwards-compatibility aliases: some code refers to names without
+# underscores (ROUTEDISCOVERY, HELLORESPONSE, etc.). Ensure both forms
+# are available as class attributes.
+try:
+    MsgType.ROUTE_DISCOVERY = MsgType.ROUTEDISCOVERY
+    MsgType.ROUTE_REPLY = MsgType.ROUTEREPLY
+    MsgType.STREAM_JOIN = MsgType.STREAMJOIN
+    MsgType.STREAM_DATA = MsgType.STREAMDATA
+    MsgType.HELLO_RESPONSE = MsgType.HELLORESPONSE
+    MsgType.STREAM_LEAVE = MsgType.STREAMLEAVE
+except Exception:
+    # If MsgType doesn't have the compact names for some reason,
+    # silently ignore (the code will use the canonical names).
+    pass

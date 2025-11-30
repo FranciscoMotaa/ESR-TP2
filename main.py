@@ -32,7 +32,7 @@ except ImportError:
 # CONSTANTES
 DEFAULT_PORT = 50000
 BOOTSTRAP_PORT = 6000
-VIDEO_FILE = "video1.mp4"
+VIDEO_FILE = "movie.Mjpeg"
 TITLE = "Overlay ESR"
 
 
@@ -129,7 +129,7 @@ class VideoGUI:
 
 # FUNÇÕES DE BOOTSTRAP
 
-def get_neighbors_dynamic(tracker_ip, my_id, my_ip, my_port=None):
+def get_neighbors_dynamic(tracker_ip, my_id, my_ip):
     """Conecta ao Tracker e recebe vizinhos iniciais"""
     print(f"[*] A contactar Tracker em {tracker_ip}:{BOOTSTRAP_PORT}...")
     try:
@@ -137,7 +137,7 @@ def get_neighbors_dynamic(tracker_ip, my_id, my_ip, my_port=None):
         sock.settimeout(3.0)
         sock.connect((tracker_ip, BOOTSTRAP_PORT))
 
-        request = json.dumps({"id": my_id, "ip": my_ip, "port": my_port})
+        request = json.dumps({"id": my_id, "ip": my_ip})
         sock.send(request.encode('utf-8'))
         
         data = sock.recv(4096)
@@ -205,13 +205,13 @@ def main():
     print(f"[*] Nó {args.node_id} ({my_ip}) a iniciar...")
 
     # Obter vizinhos do Tracker
-    initial_neighbors = get_neighbors_dynamic(args.tracker, args.node_id, my_ip, args.port)
+    initial_neighbors = get_neighbors_dynamic(args.tracker, args.node_id, my_ip)
     
     node = OverlayNode(args.node_id, my_ip, args.port)
     
     # Adicionar os vizinhos que o Tracker devolveu
-    for neighbor in initial_neighbors:
-        node.neighbors[neighbor] = {"metric": 50.0, "lastseen": 0}
+    for neighbor_ip in initial_neighbors:
+        node.neighbors[neighbor_ip] = {"metric": 50.0, "lastseen": 0}
     
     # GUARDA ESTADO INICIAL
     save_network_state(args.node_id, node.neighbors, node.routing_table)
@@ -223,23 +223,13 @@ def main():
     sock.bind(('0.0.0.0', args.port))
     sock.setblocking(0)
 
-    def dest_tuple(nip):
-        # nip pode ser 'ip:port' ou apenas 'ip'
-        if isinstance(nip, str) and ':' in nip:
-            ip, p = nip.rsplit(':', 1)
-            try:
-                return (ip, int(p))
-            except:
-                return (nip, args.port)
-        return (nip, args.port)
-
     # Se for cliente e foi pedido um stream, envia JOIN inicial aos vizinhos
     if "C" in args.node_id and args.target_stream:
         try:
             payload = json.dumps({"stream_id": args.target_stream}).encode('utf-8')
             for nip in list(node.neighbors.keys()):
                 pkt = node.pack_message(MsgType.STREAM_JOIN, nip, payload)
-                sock.sendto(pkt, dest_tuple(nip))
+                sock.sendto(pkt, (nip, args.port))
                 print(f"[*] CLIENT {args.node_id} enviou JOIN para {args.target_stream} via {nip}")
         except Exception as e:
             print(f"[ERRO JOIN] {e}")
@@ -292,10 +282,10 @@ def main():
 
             # --- A. HELLO ---
             if now - last_hello >= HELLO_INTERVAL:
-                for nip in list(node.neighbors.keys()):
+                for nip in node.neighbors:
                     pkt = node.pack_message(MsgType.HELLO, nip, b'')
                     node.pending_pings[node.sequence_number] = now
-                    sock.sendto(pkt, dest_tuple(nip))
+                    sock.sendto(pkt, (nip, args.port))
                 last_hello = now
 
             # --- B. FLOOD ---
@@ -307,9 +297,9 @@ def main():
                 }).encode('utf-8')
                 print(f"[*] A iniciar Flood para {args.node_id}")
                 
-                for nip in list(node.neighbors.keys()):
+                for nip in node.neighbors:
                     pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, nip, flood_payload)
-                    sock.sendto(pkt, dest_tuple(nip))
+                    sock.sendto(pkt, (nip, args.port))
                 last_flood = now
 
             # --- C. VÍDEO ---
@@ -337,9 +327,9 @@ def main():
                                 "data": chunk_data
                             }).encode('utf-8')
                             
-                            for client_ip in list(clients):
+                            for client_ip in clients:
                                 pkt = node.pack_message(MsgType.STREAM_DATA, client_ip, payload)
-                                sock.sendto(pkt, dest_tuple(client_ip))
+                                sock.sendto(pkt, (client_ip, args.port))
                 
                 last_frame = now
 
@@ -355,46 +345,45 @@ def main():
                 if s is sock:
                     try:
                         data, addr = sock.recvfrom(MAXPACKETSIZE)
-                        # addr = (ip, port)
-                        sender_addr = f"{addr[0]}:{addr[1]}"
-
-                        if sender_addr not in node.neighbors:
-                            print(f"[AUTO-DISCOVERY] Novo vizinho: {sender_addr}")
-                            node.neighbors[sender_addr] = {"metric": 50.0, "lastseen": 0}
-
+                        sender_ip_real = addr[0]
+                        
+                        if sender_ip_real not in node.neighbors:
+                            print(f"[AUTO-DISCOVERY] Novo vizinho: {sender_ip_real}")
+                            node.neighbors[sender_ip_real] = {"metric": 50.0, "lastseen": 0}
+                        
                         header, payload = node.unpack_message(data)
                         
                         if not header:
                             continue
                         
                         if header["type"] == MsgType.HELLO:
-                            res_payload = node.handle_hello(header, sender_addr)
-                            pkt = node.pack_message(MsgType.HELLO_RESPONSE, sender_addr, res_payload)
-                            sock.sendto(pkt, dest_tuple(sender_addr))
+                            res_payload = node.handle_hello(header, sender_ip_real)
+                            pkt = node.pack_message(MsgType.HELLO_RESPONSE, sender_ip_real, res_payload)
+                            sock.sendto(pkt, (sender_ip_real, args.port))
 
                         elif header["type"] == MsgType.HELLO_RESPONSE:
-                            node.handle_hello_response(payload, sender_addr)
+                            node.handle_hello_response(payload, sender_ip_real)
 
                         elif header["type"] == MsgType.ROUTE_DISCOVERY:
-                            new_payload = node.handle_flood(header, payload, sender_addr)
+                            new_payload = node.handle_flood(header, payload, sender_ip_real)
                             if new_payload:
-                                for nip in list(node.neighbors.keys()):
-                                    if nip != sender_addr:
+                                for nip in node.neighbors:
+                                    if nip != sender_ip_real:
                                         pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, nip, new_payload)
-                                        sock.sendto(pkt, dest_tuple(nip))
+                                        sock.sendto(pkt, (nip, args.port))
 
                         elif header["type"] == MsgType.STREAM_JOIN:
-                            upstream_ip = node.handle_join(payload, sender_addr)
+                            upstream_ip = node.handle_join(payload, sender_ip_real)
                             if upstream_ip and upstream_ip != "SOURCE":
                                 pkt = node.pack_message(MsgType.STREAM_JOIN, upstream_ip, payload)
-                                sock.sendto(pkt, dest_tuple(upstream_ip))
+                                sock.sendto(pkt, (upstream_ip, args.port))
                                 print(f"[*] Reencaminhando JOIN para {upstream_ip}")
 
                         elif header["type"] == MsgType.STREAM_LEAVE:
-                            upstream_to_prune = node.handle_leave(payload, sender_addr)
+                            upstream_to_prune = node.handle_leave(payload, sender_ip_real)
                             if upstream_to_prune and upstream_to_prune != "SOURCE":
                                 pkt = node.pack_message(MsgType.STREAM_LEAVE, upstream_to_prune, payload)
-                                sock.sendto(pkt, dest_tuple(upstream_to_prune))
+                                sock.sendto(pkt, (upstream_to_prune, args.port))
                                 print(f"[*] Reencaminhando LEAVE para {upstream_to_prune}")
 
                         elif header["type"] == MsgType.STREAM_DATA:
@@ -423,9 +412,9 @@ def main():
                                 
                                 if sid in node.routing_table:
                                     for child in node.routing_table[sid].downstream_ips:
-                                        if child != sender_addr:
+                                        if child != sender_ip_real:
                                             pkt = node.pack_message(MsgType.STREAM_DATA, child, payload)
-                                            sock.sendto(pkt, dest_tuple(child))
+                                            sock.sendto(pkt, (child, args.port))
                             
                             except Exception as e:
                                 print(f"[ERRO STREAM] {e}")

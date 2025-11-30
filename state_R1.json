@@ -1,0 +1,13 @@
+{
+  "node_id": "R1",
+  "timestamp": "2025-11-30 20:46:29",
+  "neighbors": {
+    "127.0.0.1": {
+      "metric": 50.0,
+      "lastseen": 0
+    }
+  },
+  "num_neighbors": 1,
+  "routing_table": {},
+  "num_routes": 0
+}

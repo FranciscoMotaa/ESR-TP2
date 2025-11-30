@@ -6,25 +6,25 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Set, Optional
 
 # --- CONSTANTES ---
-MAX_PACKET_SIZE = 4096 
-HEADER_FORMAT = "!B 16s 16s I d" # Type, SrcIP, DstIP, Seq, Timestamp
+MAX_PACKET_SIZE = 4096
+HEADER_FORMAT = "!B16s16sI d" # Type, SrcIP, DstIP, Seq, Timestamp
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 class MsgType(Enum):
-    HELLO = 1            
-    ROUTE_DISCOVERY = 2  # Flood (LSA)
-    ROUTE_REPLY = 3      # Reservado
-    STREAM_JOIN = 4      # Cliente pede stream
-    STREAM_DATA = 5      # Dados do video
-    HELLO_RESPONSE = 6   # <--- NOVO: Para medir RTT (Pong)
-    STREAM_LEAVE = 7     # <--- NOVO: Para parar o stream
+    HELLO = 1
+    ROUTEDISCOVERY = 2  # Flood (LSA)
+    ROUTEREPLY = 3      # Reservado
+    STREAMJOIN = 4      # Cliente pede stream
+    STREAMDATA = 5      # Dados do video
+    HELLORESPONSE = 6   # Para medir RTT (Pong)
+    STREAMLEAVE = 7     # Para parar o stream
     DEBUG = 99
 
 @dataclass
 class RouteEntry:
-    source_id: str          
-    proximo_salto_ip: str   
-    custo_acumulado: float  
+    source_id: str
+    proximos_salto_ip: str
+    custo_acumulado: float
     downstream_ips: Set[str] = field(default_factory=set)
     last_update: float = 0.0
 
@@ -70,8 +70,9 @@ class OverlayNode:
         now = time.time()
         if sender_ip not in self.neighbors:
             print(f"[{self.node_id}] Novo vizinho detetado: {sender_ip}")
-            self.neighbors[sender_ip] = {'metric': 50.0} # Começa com valor conservador
-        self.neighbors[sender_ip]['last_seen'] = now
+            self.neighbors[sender_ip] = {'metric': 50.0, 'lastseen': now} # Começa com valor conservador
+        else:
+            self.neighbors[sender_ip]['lastseen'] = now
         
         # Preparar payload de resposta com o SEQ original para o remetente calcular RTT
         response_payload = json.dumps({"ack_seq": header['seq']}).encode('utf-8')
@@ -91,7 +92,7 @@ class OverlayNode:
                 # New_Metric = 0.7 * Old + 0.3 * Current
                 old_metric = self.neighbors.get(sender_ip, {}).get('metric', rtt_ms)
                 new_metric = (0.7 * old_metric) + (0.3 * rtt_ms)
-                
+
                 self.neighbors[sender_ip]['metric'] = new_metric
                 # print(f"[METRICAS] RTT para {sender_ip}: {rtt_ms:.2f}ms (Média: {new_metric:.2f})")
         except: pass
@@ -121,7 +122,7 @@ class OverlayNode:
         else:
             rota = self.routing_table[stream_id]
             if novo_custo < rota.custo_acumulado:
-                rota.proximo_salto_ip = sender_ip_real
+                rota.proximos_salto_ip = sender_ip_real
                 rota.custo_acumulado = novo_custo
                 melhorou = True
                 print(f"[{self.node_id}] ♻️ Melhor Rota: {stream_id} via {sender_ip_real} (Custo {novo_custo:.1f}ms)")
@@ -151,7 +152,7 @@ class OverlayNode:
             if sender_ip_real not in entry.downstream_ips:
                 entry.downstream_ips.add(sender_ip_real)
                 print(f"[{self.node_id}] 🔌 Cliente {sender_ip_real} adicionado ao stream {target_stream}")
-                return entry.proximo_salto_ip
+                return entry.proximos_salto_ip
         else:
             print(f"[{self.node_id}] ❌ Recebi JOIN para {target_stream} mas não tenho rota!")
             return None
@@ -178,6 +179,9 @@ class OverlayNode:
             # Se eu não sou a fonte e já não tenho mais clientes, devo avisar o meu upstream
             if len(entry.downstream_ips) == 0 and self.node_id != target_stream:
                 print(f"[{self.node_id}] 🍂 Sem mais clientes. Vou pedir LEAVE ao upstream.")
-                return entry.proximo_salto_ip
+                return entry.proximos_salto_ip
         
         return None
+
+# Compatibilidade: exportar nome esperado por `main.py`
+MAXPACKETSIZE = MAX_PACKET_SIZE

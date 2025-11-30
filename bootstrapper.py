@@ -19,7 +19,17 @@ def handle_client(client_sock, addr):
         
         request = json.loads(data.decode('utf-8'))
         node_id = request.get('id')
-        node_ip = request.get('ip') # O nó diz o seu IP (ou usamos addr[0])
+        # aceitar também o porto no pedido
+        node_ip = request.get('ip') or addr[0]
+        node_port = request.get('port') or request.get('udp_port') or None
+        if node_port is None:
+            # se não foi enviado, tentamos obter da conexão TCP (não fiável)
+            node_port = request.get('port')
+        # normalizar para string ip:port quando possível
+        if node_port:
+            node_address = f"{node_ip}:{int(node_port)}"
+        else:
+            node_address = node_ip
         
         print(f"[TRACKER] Pedido de registo de {node_id} ({node_ip})")
         
@@ -34,15 +44,22 @@ def handle_client(client_sock, addr):
                 # Se houver poucos, devolve todos. Se houver muitos, escolhe 2.
                 k = min(len(candidates), 2)
                 selected = random.sample(candidates, k)
-                response_neighbors = [n['ip'] for n in selected]
+                # devolver ip:port se disponível
+                response_neighbors = [n.get('address', n.get('ip')) for n in selected]
             
             # 3. Adicionar este novo nó à lista (para os próximos o encontrarem)
             # Evitar duplicados (atualizar se já existe)
             existing = next((item for item in active_nodes if item["id"] == node_id), None)
             if not existing:
-                active_nodes.append({'id': node_id, 'ip': node_ip})
+                # armazenar a informação completa (ip e address)
+                entry = {'id': node_id, 'ip': node_ip}
+                if node_port:
+                    entry['address'] = node_address
+                active_nodes.append(entry)
             else:
                 existing['ip'] = node_ip # Atualiza IP se mudou
+                if node_port:
+                    existing['address'] = node_address
                 
         # 4. Enviar resposta
         response = json.dumps({

@@ -1,0 +1,10 @@
+[TRACKER] Topologia carregada de '/home/core/trabalho/ESR-TP2/bootstrap_conf.json' para 12 nós.
+[*] Bootstrapper (Tracker) a correr em 0.0.0.0:6000
+Traceback (most recent call last):
+  File "/home/core/trabalho/ESR-TP2/bootstrapper.py", line 121, in <module>
+    start_tracker()
+  File "/home/core/trabalho/ESR-TP2/bootstrapper.py", line 116, in start_tracker
+    client, addr = server.accept()
+  File "/usr/lib/python3.8/socket.py", line 292, in accept
+    fd, addr = self._accept()
+KeyboardInterrupt

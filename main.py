@@ -167,7 +167,8 @@ def save_network_state(node_id, neighbors, routing_table):
         "neighbors": {
             ip: {
                 "metric": data.get("metric", 0),
-                "lastseen": data.get("lastseen", 0)
+                "lastseen": data.get("lastseen", 0),
+                "delay": data.get("delay", 0.0)
             }
             for ip, data in neighbors.items()
         },
@@ -197,6 +198,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("node_id")
     parser.add_argument("--tracker", help="IP do Bootstrapper", required=True)
+    parser.add_argument("--delays-file", help="Ficheiro JSON com atrasos por IP (ip->ms)", default=None)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="UDP port para o nó")
     parser.add_argument("--target-stream", help="ID do stream a pedir (ex: STREAMER1)")
     args = parser.parse_args()
@@ -209,9 +211,38 @@ def main():
     
     node = OverlayNode(args.node_id, my_ip, args.port)
     
+    # Carregar atrasos opcionais por IP (em ms)
+    delays_map = {}
+    if args.delays_file:
+        try:
+            with open(args.delays_file, 'r') as df:
+                delays_map = json.load(df)
+            # garantir floats
+            delays_map = {k: float(v) for k, v in delays_map.items()}
+            print(f"[*] Atrasos carregados de {args.delays_file}: {len(delays_map)} entradas")
+        except Exception as e:
+            print(f"[WARN] Falha ao carregar delays file '{args.delays_file}': {e}")
+
     # Adicionar os vizinhos que o Tracker devolveu
-    for neighbor_ip in initial_neighbors:
-        node.neighbors[neighbor_ip] = {"metric": 50.0, "lastseen": 0}
+    # O tracker pode devolver uma lista de strings (IPs) ou objetos {"ip":..., "delay":...}
+    for n in initial_neighbors:
+        if isinstance(n, str):
+            nip = n
+            delay = 0.0
+        elif isinstance(n, dict):
+            nip = n.get('ip') or n.get('id')
+            try:
+                delay = float(n.get('delay', 0.0))
+            except Exception:
+                delay = 0.0
+        else:
+            # entrada desconhecida
+            continue
+
+        if not nip:
+            continue
+
+        node.neighbors[nip] = {"metric": 50.0, "lastseen": 0, "delay": delay}
     
     # GUARDA ESTADO INICIAL
     save_network_state(args.node_id, node.neighbors, node.routing_table)
@@ -333,7 +364,7 @@ def main():
                 
                 last_frame = now
 
-            # ← GUARDA ESTADO A CADA 10 SEGUNDOS
+            # GUARDA ESTADO A CADA 10 SEGUNDOS
             if int(now) % 10 == 0 and int(now) % 10 != last_save:
                 save_network_state(args.node_id, node.neighbors, node.routing_table)
                 last_save = int(now)
@@ -349,7 +380,8 @@ def main():
                         
                         if sender_ip_real not in node.neighbors:
                             print(f"[AUTO-DISCOVERY] Novo vizinho: {sender_ip_real}")
-                            node.neighbors[sender_ip_real] = {"metric": 50.0, "lastseen": 0}
+                            delay_ms = delays_map.get(sender_ip_real, 0.0)
+                            node.neighbors[sender_ip_real] = {"metric": 50.0, "lastseen": time.time(), "delay": float(delay_ms)}
                         
                         header, payload = node.unpack_message(data)
                         

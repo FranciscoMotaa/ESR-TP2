@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/home/core/trabalho/ESR-TP2/main.py", line 13, in <module>
+    from overlay_structs import OverlayNode, MsgType, MAXPACKETSIZE
+ImportError: cannot import name 'OverlayNode' from 'overlay_structs' (/home/core/trabalho/ESR-TP2/overlay_structs.py)

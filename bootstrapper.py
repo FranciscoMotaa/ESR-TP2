@@ -5,6 +5,8 @@ import random
 import time
 import signal
 import sys
+import os
+import atexit
 from datetime import datetime
 
 # Configuração do Tracker
@@ -131,11 +133,28 @@ def monitor_nodes():
         print_status_table()
 
 def cleanup(signum=None, frame=None):
-    """Limpa recursos ao terminar."""
+    """Limpa recursos ao terminar e mata processos filhos."""
     print("\n[*] A terminar Bootstrapper...")
+    
+    # Tentar matar todos os processos do grupo
+    try:
+        os.killpg(os.getpgid(os.getpid()), signal.SIGTERM)
+    except:
+        pass
+    
     sys.exit(0)
 
+def setup_process_group():
+    """Configura o processo para ter seu próprio grupo."""
+    try:
+        os.setpgrp()
+    except:
+        pass
+
 def start_tracker():
+    # Configurar process group
+    setup_process_group()
+    
     # Registar handlers para terminação limpa
     signal.signal(signal.SIGINT, cleanup)   # Ctrl+C
     signal.signal(signal.SIGTERM, cleanup)  # kill

@@ -12,8 +12,8 @@ from datetime import datetime
 # Configuração do Tracker
 BIND_IP = "0.0.0.0"
 BIND_PORT = 6000 # Porta TCP para registo
-HEARTBEAT_TIMEOUT = 35  # Segundos sem heartbeat = offline
-LOST_TIMEOUT = 60  # Segundos sem heartbeat = perdido
+HEARTBEAT_TIMEOUT = 10  # Segundos sem heartbeat = offline
+LOST_TIMEOUT = 500  # Segundos sem heartbeat = perdido
 
 # Lista de nós: [{'id': 'R1', 'ip': '10.0.1.1', 'last_seen': timestamp, 'status': 'alive'}, ...]
 active_nodes = []

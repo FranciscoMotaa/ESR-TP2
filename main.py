@@ -375,7 +375,7 @@ def main():
             for s in readable:
                 if s is sock:
                     try:
-                        data, addr = sock.recvfrom(MAXPACKETSIZE)
+                        data, addr = sock.recvfrom(MAX_PACKET_SIZE)
                         sender_ip_real = addr[0]
                         
                         if sender_ip_real not in node.neighbors:

@@ -10,7 +10,7 @@ import threading
 
 
 from utils import get_interface_ip
-from overlay_structs import OverlayNode, MsgType, MAXPACKETSIZE
+from overlay_structs import OverlayNode, MsgType
 
 
 try:

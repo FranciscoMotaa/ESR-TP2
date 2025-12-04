@@ -293,7 +293,7 @@ def main():
     HELLO_INTERVAL = 1.0
     FLOOD_INTERVAL = 10.0
     FRAME_INTERVAL = 0.05
-    REDISCOVERY_INTERVAL = 5.0  # Recontactar tracker a cada 5 segundos
+    REDISCOVERY_INTERVAL = 30.0  # Recontactar tracker a cada 30 segundos
     CHUNK_SIZE = 1024
 
     inputs = [sock, sys.stdin]
@@ -489,6 +489,10 @@ def main():
                     if cmd == "status":
                         print(f"[*] Vizinhos: {node.neighbors}")
                         print(f"[*] Rotas: {node.routing_table}")
+                    elif cmd == "routing":
+                        print("[*] Tabela de Roteamento:")
+                        for stream_id, entry in node.routing_table.items():
+                            print(f"Stream {stream_id}: Source={entry.source_id}, NextHop={entry.proximos_salto_ip}, Cost={entry.custo_acumulado}, Downstream={entry.downstream_ips}")
 
     except KeyboardInterrupt:
         print("[*] A sair...")
@@ -503,4 +507,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,157 +1,197 @@
-import os
 import socket
-import json
 import threading
+import json
+import random
+import time
+import signal
 import sys
-from collections import defaultdict
+import os
+import atexit
+from datetime import datetime
 
+# Configuração do Tracker
+BIND_IP = "0.0.0.0"
+BIND_PORT = 6000 # Porta TCP para registo
+HEARTBEAT_TIMEOUT = 15  # Segundos sem heartbeat = offline (maior que REDISCOVERY_INTERVAL dos nós)
+LOST_TIMEOUT = 60  # Segundos sem heartbeat = perdido
 
-PORT = 5555 # Porta do Bootstrapper
-DEFAULT_OVERLAY_PORT = 6000 # Porta padrão para nós que ainda não se registaram
-CONF_FILE = 'bootstrap_conf.json'
+# Lista de nós: [{'id': 'R1', 'ip': '10.0.1.1', 'last_seen': timestamp, 'status': 'alive'}, ...]
+active_nodes = []
+lock = threading.Lock()
 
-ACTIVE_NODES = {} # {node_id: {'ip': ip, 'port': port}} -> Mapa DINÂMICO de nós ativos
-NODE_NEIGHBORS = {} # {node_id: [neighbor_ip1, neighbor_ip2, ...]} -> Mapa ESTÁTICO de vizinhos
-
-
-def load_config():
-    """
-    Carrega a configuração da rede.
-    Cria apenas o mapa estático ID -> IPs Vizinhos.
-    """
-    global NODE_NEIGHBORS
-    
+def handle_client(client_sock, addr):
     try:
-        if not os.path.exists(CONF_FILE):
-             print(f"[ERROR] O ficheiro de configuração '{CONF_FILE}' não foi encontrado.")
-             return False
-
-        with open(CONF_FILE, 'r') as f: # Abre o ficheiro 'bootstrp_conf'
-            config_data = json.load(f) # Carrega o JSON do ficheiro
-        
-        nodes = config_data.get("nodes", [])
-        
-        for node in nodes:
-            node_id = node["id"]
-            neighbor_ips = node.get("neighbors", [])
-            
-            # Mapeia ID -> IPs dos Vizinhos (Única informação estática fiável)
-            NODE_NEIGHBORS[node_id] = neighbor_ips
-
-        # *** A lógica de criação do IP_TO_ID foi removida ***
-        
-        print(f"[CONFIG] Configuração estática carregada para {len(NODE_NEIGHBORS)} nós.")
-        return True
-
-    except json.JSONDecodeError:
-        print(f"[ERROR] O ficheiro '{CONF_FILE}' contém JSON inválido.")
-        return False
-    except Exception as e:
-        print(f"[ERROR] Erro ao carregar ou processar o ficheiro de configuração: {e}")
-        return False
-    
-
-def handle_client(client_socket, client_address):
-    """
-    Lida com a conexão TCP de um nó overlay que se está a registar.
-    
-    O nó que se regista DEVE enviar o seu ID, IP (para onde o podem contactar) e PORTA.
-    """
-    try:
-        # Recebe a mensagem de registo do nó
-        data = client_socket.recv(4096)
+        # 1. Receber pedido de registo
+        data = client_sock.recv(1024)
         if not data: return
-
-        # Assume que o nó envia {'id': 'R3', 'ip': '10.0.10.1', 'port': 6000}
-        reg_info = json.loads(data.decode('utf-8'))
         
-        node_id = reg_info.get('id')
-        node_ip = reg_info.get('ip', client_address[0]) # Usa o IP do socket como fallback
-        node_port = reg_info.get('port', DEFAULT_OVERLAY_PORT)
+        request = json.loads(data.decode('utf-8'))
+        node_id = request.get('id')
+        node_ip = request.get('ip') # O nó diz o seu IP (ou usamos addr[0])
         
-        if not node_id:
-            print("[ERROR] Registo inválido: falta o ID do nó.")
-            return
-
-        # 1. Registo do Nó (Aprende o IP/Porta do nó que se regista)
-        ACTIVE_NODES[node_id] = {'ip': node_ip, 'port': node_port}
-        print(f"[BOOTSTRAP] Nó registrado: {node_id} @ {node_ip}:{node_port}")
-
-        # 2. Obtém os IPs dos vizinhos (Lista estática do JSON)
-        neighbor_ips = NODE_NEIGHBORS.get(node_id, []) 
-        # 3. Constrói a lista de vizinhos a devolver
-        neighbors_to_send = []
-        for n_ip in neighbor_ips:
-            # Assumimos que o IP listado no JSON (n_ip) é o IP de contacto do vizinho.
+        print(f"[TRACKER] Pedido de registo de {node_id} ({node_ip})")
+        
+        response_neighbors = []
+        
+        with lock:
+            # 2. Escolher vizinhos aleatórios para ele (ex: 2 vizinhos)
+            # Filtra para não devolver o próprio nó
+            candidates = [n for n in active_nodes if n['id'] != node_id]
             
-            neighbor_is_active = False
-            found_neighbor_id = n_ip # ID padrão: o IP (Se não for encontrado)
-            n_data = {'ip': n_ip, 'port': DEFAULT_OVERLAY_PORT}
+            if len(candidates) > 0:
+                # Se houver poucos, devolve todos. Se houver muitos, escolhe 3-4.
+                k = min(len(candidates), 4)
+                selected = random.sample(candidates, k)
+                response_neighbors = [n['ip'] for n in selected]
             
-            # Pesquisa por correspondência de IP em todos os nós ativos
-            for active_id, active_info in ACTIVE_NODES.items():
-                if active_info['ip'] == n_ip:
-                    # Caso A: Vizinho encontrado e está ativo
-                    found_neighbor_id = active_id
-                    n_data = active_info
-                    neighbor_is_active = True
-                    break
-            
-            if neighbor_is_active:
-                # Se o vizinho está ativo, devolvemos os dados de registo
-                neighbors_to_send.append({
-                    'id': found_neighbor_id,
-                    'ip': n_data['ip'],
-                    'port': n_data['port'] 
+            # 3. Adicionar este novo nó à lista (para os próximos o encontrarem)
+            # Evitar duplicados (atualizar se já existe)
+            existing = next((item for item in active_nodes if item["id"] == node_id), None)
+            if not existing:
+                active_nodes.append({
+                    'id': node_id, 
+                    'ip': node_ip, 
+                    'last_seen': time.time(),
+                    'status': 'alive'
                 })
             else:
-                # Caso B: Vizinho inativo. Não podemos saber o seu ID real, 
-                # mas devolvemos o IP de contacto (n_ip) e o ID (assumido) é o próprio IP.
-                neighbors_to_send.append({
-                    'id': n_ip, # O nó que se regista terá de tentar conectar-se com este IP.
-                    'ip': n_ip, 
-                    'port': DEFAULT_OVERLAY_PORT 
-                })
-        
-        # 4. Envia a resposta TCP ao nó que se está a registar
-        response = {'status': 'OK', 'neighbors': neighbors_to_send}
-        client_socket.sendall(json.dumps(response).encode('utf-8'))
-        
-    except json.JSONDecodeError:
-        response = {'status': 'ERROR', 'message': 'JSON inválido.'}
-        client_socket.sendall(json.dumps(response).encode('utf-8'))
+                existing['ip'] = node_ip
+                existing['last_seen'] = time.time()
+                existing['status'] = 'alive'
+                
+        # 4. Enviar resposta
+        response = json.dumps({
+            "status": "OK",
+            "neighbors": response_neighbors
+        })
+        client_sock.send(response.encode('utf-8'))
+        print(f"[TRACKER] {node_id} registado. Vizinhos atribuídos: {response_neighbors}")
+
     except Exception as e:
-        print(f"[ERROR] Erro no manuseamento do cliente: {e}")
+        print(f"[ERRO] {e}")
     finally:
-        client_socket.close()
+        client_sock.close()
 
+def update_node_status():
+    """Atualiza o estado de todos os nós baseado no último heartbeat."""
+    now = time.time()
+    with lock:
+        for node in active_nodes:
+            time_since_seen = now - node.get('last_seen', 0)
+            
+            if time_since_seen > LOST_TIMEOUT:
+                node['status'] = 'lost'
+            elif time_since_seen > HEARTBEAT_TIMEOUT:
+                node['status'] = 'offline'
+            else:
+                node['status'] = 'alive'
 
-
-
-#iniciar o servidor  eiode
-
-def start_server():
-    """Inicia o servidor TCP de bootstrap."""
-    if not load_config(): 
-        print("Impossível carregar a configuração. Servidor não iniciado.")
+def print_status_table():
+    """Imprime tabela formatada com estado de todos os nós."""
+    with lock:
+        nodes_copy = active_nodes.copy()
+    
+    if not nodes_copy:
         return
+    
+    print("\n" + "="*70)
+    print(f"{'ID':<15} {'IP':<18} {'STATUS':<10} {'LAST SEEN':<20}")
+    print("="*70)
+    
+   
+    for node in sorted(nodes_copy, key=lambda x: x['id']):
+        node_id = node['id']
+        node_ip = node['ip']
+        status = node.get('status', 'unknown')
+        last_seen = node.get('last_seen', 0)
         
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        time_ago = int(time.time() - last_seen)
+        if time_ago < 60:
+            last_seen_str = f"{time_ago}s ago"
+        else:
+            last_seen_str = f"{time_ago//60}m {time_ago%60}s ago"
+        
+        status_display = status.upper()
+        
+        print(f"{node_id:<15} {node_ip:<18} {status_display:<10} {last_seen_str:<20}")
+    
+    print("="*70)
+    
+    # Estatísticas
+    alive = sum(1 for n in nodes_copy if n.get('status') == 'alive')
+    offline = sum(1 for n in nodes_copy if n.get('status') == 'dead')
+    lost = sum(1 for n in nodes_copy if n.get('status') == '')
+    
+    print(f"Total: {len(nodes_copy)} | Alive: {alive} | Offline: {offline} | Lost: {lost}")
+    print("="*70 + "\n")
+
+def monitor_nodes():
+    """Thread que monitoriza estado dos nós periodicamente."""
+    while True:
+        time.sleep(10)  # Atualizar a cada 10 segundos
+        update_node_status()
+        print_status_table()
+
+def cleanup(signum=None, frame=None):
+    """Limpa recursos ao terminar e mata processos filhos."""
+    print("\n[*] A terminar Bootstrapper...")
+    
+    # Tentar matar todos os processos do grupo
     try:
-        # Liga a 0.0.0.0 para aceitar conexões em qualquer interface
-        server_socket.bind(("0.0.0.0", PORT)) 
-        server_socket.listen()
-        print(f"Bootstrapper iniciado e a escutar na porta {PORT}...")
+        os.killpg(os.getpgid(os.getpid()), signal.SIGTERM)
+    except:
+        pass
+    
+    sys.exit(0)
 
+def setup_process_group():
+    """Configura o processo para ter seu próprio grupo."""
+    try:
+        os.setpgrp()
+    except:
+        pass
+
+def start_tracker():
+    # Configurar process group
+    setup_process_group()
+    
+    # Registar handlers para terminação limpa
+    signal.signal(signal.SIGINT, cleanup)   # Ctrl+C
+    signal.signal(signal.SIGTERM, cleanup)  # kill
+    
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    try:
+        server.bind((BIND_IP, BIND_PORT))
+    except OSError as e:
+        if e.errno == 98:  # Address already in use
+            print(f"[ERRO] Porta {BIND_PORT} já está em uso!")
+            print("Para libertar a porta:")
+            print(f"  sudo lsof -ti :{BIND_PORT} | xargs kill -9")
+            print("  ou: pkill -f bootstrapper.py")
+            sys.exit(1)
+        raise
+    
+    server.listen(5)
+    print(f"[*] Bootstrapper (Tracker) a correr em {BIND_IP}:{BIND_PORT}")
+    print(f"[*] Heartbeat timeout: {HEARTBEAT_TIMEOUT}s (offline) | {LOST_TIMEOUT}s (lost)")
+    print("[*] Pressiona Ctrl+C para parar\n")
+    
+    # Iniciar thread de monitorização
+    monitor_thread = threading.Thread(target=monitor_nodes, daemon=True)
+    monitor_thread.start()
+    
+    try:
         while True:
-            client_socket, client_address = server_socket.accept()
-            # Inicia uma thread para lidar com cada novo nó
-            threading.Thread(target=handle_client, args=(client_socket, client_address)).start()
-    except Exception as e:
-        print(f"Erro fatal no servidor: {e}")
+            client, addr = server.accept()
+            client_handler = threading.Thread(target=handle_client, args=(client, addr))
+            client_handler.start()
+    except KeyboardInterrupt:
+        cleanup()
     finally:
-        server_socket.close()
+        server.close()
 
-if __name__ == '__main__':
-    start_server()
 
+if __name__ == "__main__":
+    start_tracker()

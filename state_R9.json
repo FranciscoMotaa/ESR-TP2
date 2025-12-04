@@ -1,0 +1,24 @@
+{
+  "node_id": "R9",
+  "timestamp": "2025-12-04 16:55:05",
+  "neighbors": {
+    "10.0.2.2": {
+      "metric": 50.0,
+      "lastseen": 0,
+      "delay": 0.0
+    },
+    "10.0.0.2": {
+      "metric": 50.0,
+      "lastseen": 0,
+      "delay": 0.0
+    },
+    "10.0.0.1": {
+      "metric": 50.0,
+      "lastseen": 0,
+      "delay": 0.0
+    }
+  },
+  "num_neighbors": 3,
+  "routing_table": {},
+  "num_routes": 0
+}

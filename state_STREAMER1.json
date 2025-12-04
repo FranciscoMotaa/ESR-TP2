@@ -1,0 +1,29 @@
+{
+  "node_id": "STREAMER1",
+  "timestamp": "2025-12-04 16:59:06",
+  "neighbors": {
+    "10.0.3.2": {
+      "metric": 50.0,
+      "lastseen": 0,
+      "delay": 0.0
+    },
+    "10.0.0.2": {
+      "metric": 50.0,
+      "lastseen": 0,
+      "delay": 0.0
+    },
+    "10.0.2.2": {
+      "metric": 50.0,
+      "lastseen": 0,
+      "delay": 0.0
+    },
+    "10.0.10.2": {
+      "metric": 50.0,
+      "lastseen": 0,
+      "delay": 0.0
+    }
+  },
+  "num_neighbors": 4,
+  "routing_table": {},
+  "num_routes": 0
+}

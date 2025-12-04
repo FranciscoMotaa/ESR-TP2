@@ -1,0 +1,19 @@
+{
+  "node_id": "R8",
+  "timestamp": "2025-12-04 16:54:42",
+  "neighbors": {
+    "10.0.0.2": {
+      "metric": 50.0,
+      "lastseen": 0,
+      "delay": 0.0
+    },
+    "10.0.0.1": {
+      "metric": 50.0,
+      "lastseen": 0,
+      "delay": 0.0
+    }
+  },
+  "num_neighbors": 2,
+  "routing_table": {},
+  "num_routes": 0
+}

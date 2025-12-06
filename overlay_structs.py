@@ -16,8 +16,11 @@ class MsgType(Enum):
     ROUTE_REPLY = 3      # Reservado
     STREAM_JOIN = 4      # Cliente pede stream
     STREAM_DATA = 5      # Dados do video
-    HELLO_RESPONSE = 6   # <--- NOVO: Para medir RTT (Pong)
-    STREAM_LEAVE = 7     # <--- NOVO: Para parar o stream
+    HELLO_RESPONSE = 6   # Para medir RTT (Pong)
+    STREAM_LEAVE = 7     # Para parar o stream
+    STREAM_FEC = 8       # Pacote de Correção de Erro (Paridade)
+    STREAM_REPORT = 9    # Relatório de Qualidade (Feedback do Cliente)
+    ACK_JOIN = 10        # Confirmação de JOIN para fiabilidade
     DEBUG = 99
 
 @dataclass
@@ -37,9 +40,6 @@ class OverlayNode:
         self.neighbors: Dict[str, Dict] = {}
         self.routing_table: Dict[str, RouteEntry] = {}
         self.lsa_database: Dict[tuple, float] = {}
-        
-        # Armazena timestamps dos Hellos enviados para calcular RTT
-        # { sequence_number: timestamp_envio }
         self.pending_pings: Dict[int, float] = {}
 
     def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"") -> bytes:
@@ -66,34 +66,23 @@ class OverlayNode:
     # --- LÓGICA DE PROTOCOLO ---
 
     def handle_hello(self, header, sender_ip):
-        """Recebi um Ping. Devo responder com Pong."""
         now = time.time()
-        if sender_ip not in self.neighbors:
-            print(f"[{self.node_id}] Novo vizinho detetado: {sender_ip}")
-            self.neighbors[sender_ip] = {'metric': 50.0} # Começa com valor conservador
-        self.neighbors[sender_ip]['last_seen'] = now
-        
-        # Preparar payload de resposta com o SEQ original para o remetente calcular RTT
-        response_payload = json.dumps({"ack_seq": header['seq']}).encode('utf-8')
-        return response_payload
+        # Modo Estrito: Só responder se for vizinho conhecido
+        if sender_ip in self.neighbors:
+            self.neighbors[sender_ip]['last_seen'] = now
+            return json.dumps({"ack_seq": header['seq']}).encode('utf-8')
+        return b""
 
     def handle_hello_response(self, payload, sender_ip):
-        """Recebi um Pong. Calcular RTT."""
         try:
             data = json.loads(payload.decode('utf-8'))
             ack_seq = data['ack_seq']
-            
             if ack_seq in self.pending_pings:
                 start_time = self.pending_pings.pop(ack_seq)
-                rtt_ms = (time.time() - start_time) * 1000.0 # Converter para ms
-                
-                # Suavização da métrica (Média Móvel Exponencial) para evitar oscilações bruscas
-                # New_Metric = 0.7 * Old + 0.3 * Current
+                rtt_ms = (time.time() - start_time) * 1000.0 
                 old_metric = self.neighbors.get(sender_ip, {}).get('metric', rtt_ms)
                 new_metric = (0.7 * old_metric) + (0.3 * rtt_ms)
-                
                 self.neighbors[sender_ip]['metric'] = new_metric
-                # print(f"[METRICAS] RTT para {sender_ip}: {rtt_ms:.2f}ms (Média: {new_metric:.2f})")
         except: pass
 
     def handle_flood(self, header, payload, sender_ip_real):
@@ -104,27 +93,26 @@ class OverlayNode:
             origin_seq = data['origin_seq']
         except: return None
 
+        # Modo Estrito: Ignorar flood de desconhecidos
+        if sender_ip_real not in self.neighbors: return None
+
         lsa_key = (stream_id, origin_seq)
         if lsa_key in self.lsa_database: return None
         self.lsa_database[lsa_key] = time.time()
 
-        # --- AQUI ESTÁ A MUDANÇA: Usar a métrica real do link ---
-        metric_link = self.neighbors.get(sender_ip_real, {}).get('metric', 50.0) # Default se desconhecido
+        metric_link = self.neighbors[sender_ip_real]['metric']
         novo_custo = custo_recebido + metric_link
-        # --------------------------------------------------------
 
         melhorou = False
         if stream_id not in self.routing_table:
             self.routing_table[stream_id] = RouteEntry(stream_id, sender_ip_real, novo_custo)
             melhorou = True
-            print(f"[{self.node_id}] 🗺️ Rota: {stream_id} via {sender_ip_real} (Custo {novo_custo:.1f}ms)")
         else:
             rota = self.routing_table[stream_id]
             if novo_custo < rota.custo_acumulado:
                 rota.proximo_salto_ip = sender_ip_real
                 rota.custo_acumulado = novo_custo
                 melhorou = True
-                print(f"[{self.node_id}] ♻️ Melhor Rota: {stream_id} via {sender_ip_real} (Custo {novo_custo:.1f}ms)")
 
         if melhorou:
             data['cost'] = novo_custo
@@ -132,35 +120,35 @@ class OverlayNode:
         return None
 
     def handle_join(self, payload, sender_ip_real):
+        """
+        Retorna: (upstream_ip, send_ack)
+        """
         try:
             data = json.loads(payload.decode('utf-8'))
             target_stream = data['stream_id']
-        except: return None
+        except: return None, False
 
+        # Se sou Streamer
         if self.node_id == target_stream:
             if target_stream not in self.routing_table:
                 self.routing_table[target_stream] = RouteEntry(target_stream, "SELF", 0.0)
             entry = self.routing_table[target_stream]
             if sender_ip_real not in entry.downstream_ips:
                 entry.downstream_ips.add(sender_ip_real)
-                print(f"[{self.node_id}] 🎬 CLIENTE REGISTADO! A enviar stream para {sender_ip_real}")
-            return "SOURCE"
+                print(f"[{self.node_id}] 🎬 NOVO CLIENTE: {sender_ip_real}")
+            return "SOURCE", True # True = Enviar ACK
 
+        # Se sou Router
         if target_stream in self.routing_table:
             entry = self.routing_table[target_stream]
             if sender_ip_real not in entry.downstream_ips:
                 entry.downstream_ips.add(sender_ip_real)
-                print(f"[{self.node_id}] 🔌 Cliente {sender_ip_real} adicionado ao stream {target_stream}")
-                return entry.proximo_salto_ip
-        else:
-            print(f"[{self.node_id}] ❌ Recebi JOIN para {target_stream} mas não tenho rota!")
-            return None
+                print(f"[{self.node_id}] 🔌 Cliente adicionado: {sender_ip_real}")
+            return entry.proximo_salto_ip, True # True = Enviar ACK
+        
+        return None, False
 
     def handle_leave(self, payload, sender_ip_real):
-        """
-        Remove um cliente da lista de distribuição.
-        Retorna o IP do upstream se for necessário fazer Pruning (poda), ou None.
-        """
         try:
             data = json.loads(payload.decode('utf-8'))
             target_stream = data['stream_id']
@@ -168,16 +156,28 @@ class OverlayNode:
 
         if target_stream in self.routing_table:
             entry = self.routing_table[target_stream]
-            
-            # Remover o cliente da lista de downstream
             if sender_ip_real in entry.downstream_ips:
                 entry.downstream_ips.remove(sender_ip_real)
-                print(f"[{self.node_id}] ✂️ Cliente {sender_ip_real} saiu do stream {target_stream}")
+                print(f"[{self.node_id}] ✂️ Cliente saiu: {sender_ip_real}")
             
-            # Lógica de PRUNING (Poda da Árvore)
-            # Se eu não sou a fonte e já não tenho mais clientes, devo avisar o meu upstream
             if len(entry.downstream_ips) == 0 and self.node_id != target_stream:
-                print(f"[{self.node_id}] 🍂 Sem mais clientes. Vou pedir LEAVE ao upstream.")
+                print(f"[{self.node_id}] 🍂 Sem clientes. Pedindo corte ao upstream.")
                 return entry.proximo_salto_ip
+        return None
+
+    def handle_report(self, payload, sender_ip_real):
+        try:
+            data = json.loads(payload.decode('utf-8'))
+            target_stream = data['stream_id']
+            packet_loss = data.get('loss_rate', 0.0)
+            client_id = data.get('client_id', 'unknown')
+        except: return None
+
+        if self.node_id == target_stream:
+            print(f"[{self.node_id}] 📊 Relatório {client_id}: Perda {packet_loss:.1f}%")
+            return "SOURCE"
         
+        if target_stream in self.routing_table:
+            entry = self.routing_table[target_stream]
+            return entry.proximo_salto_ip
         return None

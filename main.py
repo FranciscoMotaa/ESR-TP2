@@ -5,6 +5,8 @@ import json
 import argparse
 import time
 import base64
+from PIL import Image, ImageTk
+import io
 import math
 from utils import get_interface_ip
 from overlay_structs import OverlayNode, MsgType, MAX_PACKET_SIZE
@@ -113,7 +115,7 @@ def main():
     args = parser.parse_args()
 
     my_ip = get_interface_ip()
-    print(f"[*] Nó {args.node_id} ({my_ip}) ONLINE (Modo Estrito)")
+    print(f"[*] Nó {args.node_id} ({my_ip}) ONLINE")
 
     initial_neighbors = get_neighbors_dynamic(args.tracker, args.node_id, my_ip)
     
@@ -132,7 +134,9 @@ def main():
         try:
             root = tk.Tk()
             gui = VideoGUI(root, f"Cliente {args.node_id}")
-        except: pass
+        except Exception as e:
+            print(f"\n[ERRO CRÍTICO GUI] Não consigo abrir a janela: {e}")
+            print("[DICA] Tente fazer 'export DISPLAY=:0' no terminal antes de rodar.")
 
     reassembly_buffer = {} 
     
@@ -151,7 +155,12 @@ def main():
     
     HELLO_INTERVAL = 1.0 
     FLOOD_INTERVAL = 10.0 
-    FRAME_INTERVAL = 0.05 
+    
+    # --- CONTROLO DE CONGESTIONAMENTO ---
+    FRAME_INTERVAL = 0.50 # Começa a 20 FPS (0.05s)
+    MIN_INTERVAL = 0.03   # Max ~30 FPS
+    MAX_INTERVAL = 0.5    # Min ~2 FPS
+    
     CHUNK_SIZE = 1024 
     JOIN_TIMEOUT = 5.0
     REPORT_INTERVAL = 5.0
@@ -167,6 +176,12 @@ def main():
     
     try:
         while True:
+            if gui:
+                try:
+                    gui.root.update_idletasks()
+                    gui.root.update()
+                except: pass
+
             now = time.time()
             
             # --- 1. Retransmissão de JOIN ---
@@ -204,7 +219,7 @@ def main():
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
                 last_flood = now
 
-            # --- 4. QoS Reports ---
+            # --- 4. QoS Reports (Cliente) ---
             if "C" in args.node_id and now - last_report >= REPORT_INTERVAL:
                 if stats_frames_received > 0 or stats_frames_lost > 0:
                     total = stats_frames_received + stats_frames_lost
@@ -219,7 +234,7 @@ def main():
                          stats_frames_lost = 0
                 last_report = now
 
-            # --- 5. Vídeo ---
+            # --- 5. Vídeo (Streamer) ---
             if is_streamer and video_stream and now - last_frame >= FRAME_INTERVAL:
                 if args.node_id in node.routing_table:
                     clients = node.routing_table[args.node_id].downstream_ips
@@ -258,14 +273,11 @@ def main():
                         data, addr = sock.recvfrom(MAX_PACKET_SIZE)
                         sender_ip_real = addr[0]
                         
-                        # --- FILTRO ESTRITO DE SEGURANÇA ---
-                        # Só processamos pacotes de vizinhos conhecidos pelo Tracker.
-                        # Isto impede que o C4 aprenda sobre o R1 (10.0.0.1) se este não estiver no JSON.
-                        if sender_ip_real not in node.neighbors:
-                            # Opcional: Descomente para ver o que está a ser bloqueado
-                            # print(f"[BLOCKED] Pacote ignorado de {sender_ip_real} (não é vizinho autorizado)")
-                            continue
-                        # -----------------------------------
+                        #if sender_ip_real not in node.neighbors:
+                            # Filtro Estrito para demo segura (mas se preferir auto-discovery descomente)
+                            # print(f"[AUTO] Novo vizinho detetado: {sender_ip_real}")
+                            # node.neighbors[sender_ip_real] = {'metric': 50.0, 'last_seen': 0}
+                            #continue # Ignora desconhecidos para forçar topologia do JSON
 
                         header, payload = node.unpack_message(data)
                         if not header: continue
@@ -287,6 +299,19 @@ def main():
                                         sock.sendto(pkt, (n_ip, DEFAULT_PORT))
 
                         elif header['type'] == MsgType.STREAM_JOIN:
+                            # Antes de processar, verificar se já estamos a fornecer esta stream
+                            try:
+                                jdata_preview = json.loads(payload.decode('utf-8'))
+                                sid_preview = jdata_preview.get('stream_id')
+                            except:
+                                sid_preview = None
+
+                            had_downstream = False
+                            if sid_preview and sid_preview in node.routing_table:
+                                try:
+                                    had_downstream = len(node.routing_table[sid_preview].downstream_ips) > 0
+                                except: had_downstream = False
+
                             upstream_ip, send_ack = node.handle_join(payload, sender_ip_real)
                             if send_ack:
                                 try:
@@ -297,7 +322,15 @@ def main():
                                     sock.sendto(ack_pkt, (sender_ip_real, DEFAULT_PORT))
                                 except: pass
 
-                            if upstream_ip and upstream_ip != "SOURCE":
+                            # Se já tínhamos clientes para esta stream (i.e., já estamos a fornecer),
+                            # não propagamos o JOIN upstream — passamos a servir o novo downstream.
+                            already_serving = False
+                            if sid_preview:
+                                try:
+                                    already_serving = had_downstream or (node.node_id == sid_preview)
+                                except: already_serving = had_downstream
+
+                            if upstream_ip and upstream_ip != "SOURCE" and not already_serving:
                                 pkt = node.pack_message(MsgType.STREAM_JOIN, upstream_ip, payload)
                                 sock.sendto(pkt, (upstream_ip, DEFAULT_PORT))
                                 print(f"[⬆️] JOIN propagado -> {upstream_ip}")
@@ -316,7 +349,24 @@ def main():
 
                         elif header['type'] == MsgType.STREAM_REPORT:
                             upstream_report = node.handle_report(payload, sender_ip_real)
-                            if upstream_report and upstream_report != "SOURCE":
+                            
+                            # Se sou o Streamer, ajusto a velocidade!
+                            if upstream_report == "SOURCE":
+                                try:
+                                    info = json.loads(payload.decode('utf-8'))
+                                    loss = info.get('loss_rate', 0.0)
+                                    client = info.get('client_id')
+                                    
+                                    # LÓGICA DE CONTROLO DE CONGESTIONAMENTO
+                                    if loss > 10.0:
+                                        FRAME_INTERVAL = min(FRAME_INTERVAL * 1.5, MAX_INTERVAL)
+                                        print(f"[⚠️] Congestionamento ({loss:.1f}%). Reduzindo FPS para {1/FRAME_INTERVAL:.1f} Hz")
+                                    elif loss < 2.0:
+                                        FRAME_INTERVAL = max(FRAME_INTERVAL * 0.9, MIN_INTERVAL)
+                                        # print(f"[🚀] Rede boa. Aumentando FPS para {1/FRAME_INTERVAL:.1f} Hz")
+                                except: pass
+                            
+                            elif upstream_report:
                                 pkt = node.pack_message(MsgType.STREAM_REPORT, upstream_report, payload)
                                 sock.sendto(pkt, (upstream_report, DEFAULT_PORT))
 

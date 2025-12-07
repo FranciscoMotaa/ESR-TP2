@@ -1,0 +1,54 @@
+# Simulação de Streaming de Vídeo P2P (Overlay Network)
+
+Este projeto implementa uma rede de overlay capaz de transmitir vídeo em tempo real (MJPEG) sobre UDP, com mecanismos de controlo de fluxo, FEC (Forward Error Correction) e descoberta de rotas dinâmica.
+
+## ⚠️ Pré-requisitos do Sistema (Linux/Xubuntu)
+
+Antes de tocar no Python, é obrigatório instalar as bibliotecas de sistema para suporte gráfico e manipulação de imagem. Abra um terminal e corra:
+
+```bash
+sudo apt update
+sudo apt install python3 python3-pip python3-venv python3-tk python3-pil.imagetk
+
+
+# Criar o ambiente
+python3 -m venv venv
+
+# Ativar o ambiente (FAZER ISTO EM TODOS OS TERMINAIS QUE ABRIREM)
+source venv/bin/activate
+
+pip install opencv-python Pillow
+
+xhost +
+
+
+###### INICIAR A TOPOLOGIA #####
+
+1º Iniciar a simulação no core
+
+2º Ir ao R3 e colocar os seguintes comandos no terminal:
+    cd vossa/pasta/do/projeto
+    python3 bootstrapper.py
+
+3º Ir ao Routers e Clientes e colocar os seguintes comandos no terminal:
+    cd vossa/pasta/do/projeto
+    python3 main.py R1 --tracker 10.0.10.1 # O R1 quer dizer que é para o router 1, se forem para o R7 colocam R7 e assim diante 
+    
+    ATENÇÃO ANTES DE INICIAR OS CLIENTES TEM DE EXPORTAR O DISPLAY e depois usar o main.py C... !!
+
+    export DISPLAY=:0
+    
+    python3 main.py C6 --tracker 10.0.10.1 # O C6 quer dizer que é para o cliente 6, se forem para o C5 colocam C5 e assim diante
+
+
+4º Por fim ir aos STREAMERS e colocar os seguintes comandos no terminal:
+    cd vossa/pasta/do/projeto
+    python3 main.py STREAMER1 --tracker 10.0.10.1 # Vai começar o processo de streaming e a enviar o flood
+
+5º Meter o cliente a ver o vídeo e outros comandos
+    Ir ao terminal do cliente que querem ver o vídeo e colocar o seguinte comando:
+    
+    join STREAMER1      # O STREAMER1 é o nome do streamer que querem ver o vídeo, se for outro nome colocam o nome correto (STREAMER2)
+    status
+    leave STREAMER1
+

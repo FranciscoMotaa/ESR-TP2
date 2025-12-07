@@ -77,16 +77,27 @@ class VideoGUI:
         self.root.title(title)
         self.label = Label(root)
         self.label.pack()
+        # Truque para manter a janela visível
+        self.root.update_idletasks()
         self.root.update()
 
     def update_image(self, data_bytes):
         try:
-            image = tk.PhotoImage(data=data_bytes) 
-            self.label.configure(image=image)
-            self.label.image = image
+            # Tenta carregar a imagem usando o Pillow (suporta JPEG)
+            image_stream = io.BytesIO(data_bytes)
+            pil_image = Image.open(image_stream)
+            tk_image = ImageTk.PhotoImage(pil_image)
+            
+            self.label.configure(image=tk_image)
+            self.label.image = tk_image # Evita Garbage Collection
+            
+            # Força o redesenho imediato
+            self.root.update_idletasks()
             self.root.update()
+            
         except Exception as e:
-            pass
+            # AGORA VAMOS VER O ERRO SE FALHAR
+            print(f"[ERRO GUI] Falha ao renderizar frame: {e}")
 
 def get_neighbors_dynamic(tracker_ip, my_id, my_ip):
     try:
@@ -161,7 +172,7 @@ def main():
     MIN_INTERVAL = 0.03   # Max ~30 FPS
     MAX_INTERVAL = 0.5    # Min ~2 FPS
     
-    CHUNK_SIZE = 1024 
+    CHUNK_SIZE = 700
     JOIN_TIMEOUT = 5.0
     REPORT_INTERVAL = 5.0
     
@@ -213,7 +224,7 @@ def main():
                     "cost": 0,
                     "origin_seq": int(now)
                 }).encode('utf-8')
-                print(f"[📢] A iniciar Flood (Seq {int(now)})...") 
+                print(f" A iniciar Flood (Seq {int(now)})...") 
                 for n_ip in node.neighbors:
                     pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload)
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
@@ -238,12 +249,18 @@ def main():
             if is_streamer and video_stream and now - last_frame >= FRAME_INTERVAL:
                 if args.node_id in node.routing_table:
                     clients = node.routing_table[args.node_id].downstream_ips
+
                     if clients:
                         raw_bytes = video_stream.next_frame()
+
                         if raw_bytes:
                             frame_seq += 1
                             b64_data = base64.b64encode(raw_bytes).decode('utf-8')
                             num_chunks = math.ceil(len(b64_data) / CHUNK_SIZE)
+                            total_packets_to_send = num_chunks + 1
+                            # dar 0.05s para enviar tudo
+                            pacing_delay = (FRAME_INTERVAL * 0.85) / max(total_packets_to_send, 1)
+
                             chunks_list = []
                             for i in range(num_chunks):
                                 chunk_data = b64_data[i*CHUNK_SIZE : (i+1)*CHUNK_SIZE]
@@ -254,14 +271,18 @@ def main():
                                 for client_ip in clients:
                                     pkt = node.pack_message(MsgType.STREAM_DATA, client_ip, payload)
                                     sock.sendto(pkt, (client_ip, DEFAULT_PORT))
-                            
+                                time.sleep(pacing_delay)
+
                             fec_data = FECEngine.create_parity_packet(chunks_list)
                             fec_payload = json.dumps({
                                 "id": args.node_id, "fid": frame_seq, "tot": num_chunks, "data": fec_data
                             }).encode('utf-8')
+
                             for client_ip in clients:
                                 pkt = node.pack_message(MsgType.STREAM_FEC, client_ip, fec_payload)
                                 sock.sendto(pkt, (client_ip, DEFAULT_PORT))
+
+                            time.sleep(pacing_delay)
                 last_frame = now
 
             # --- EVENT LOOP ---
@@ -333,11 +354,11 @@ def main():
                             if upstream_ip and upstream_ip != "SOURCE" and not already_serving:
                                 pkt = node.pack_message(MsgType.STREAM_JOIN, upstream_ip, payload)
                                 sock.sendto(pkt, (upstream_ip, DEFAULT_PORT))
-                                print(f"[⬆️] JOIN propagado -> {upstream_ip}")
+                                print(f" JOIN propagado -> {upstream_ip}")
 
                         elif header['type'] == MsgType.ACK_JOIN:
                             if join_state['active']:
-                                print(f"[✅] ACK recebido de {sender_ip_real}! Ligação estabelecida.")
+                                print(f" ACK recebido de {sender_ip_real}! Ligação estabelecida.")
                                 join_state['active'] = False 
 
                         elif header['type'] == MsgType.STREAM_LEAVE:
@@ -360,7 +381,7 @@ def main():
                                     # LÓGICA DE CONTROLO DE CONGESTIONAMENTO
                                     if loss > 10.0:
                                         FRAME_INTERVAL = min(FRAME_INTERVAL * 1.5, MAX_INTERVAL)
-                                        print(f"[⚠️] Congestionamento ({loss:.1f}%). Reduzindo FPS para {1/FRAME_INTERVAL:.1f} Hz")
+                                        print(f" Congestionamento ({loss:.1f}%). Reduzindo FPS para {1/FRAME_INTERVAL:.1f} Hz")
                                     elif loss < 2.0:
                                         FRAME_INTERVAL = max(FRAME_INTERVAL * 0.9, MIN_INTERVAL)
                                         # print(f"[🚀] Rede boa. Aumentando FPS para {1/FRAME_INTERVAL:.1f} Hz")
@@ -430,7 +451,7 @@ def main():
                                         try:
                                             ibytes = base64.b64decode(full)
                                             if gui: gui.update_image(ibytes)
-                                            print(f"\r[✨] Frame {fid} RECUPERADO!", end="")
+                                            print(f"\r Frame {fid} RECUPERADO!", end="")
                                             sys.stdout.flush()
                                             success = True
                                         except: pass

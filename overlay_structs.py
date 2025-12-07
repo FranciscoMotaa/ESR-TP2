@@ -85,7 +85,7 @@ class OverlayNode:
                 self.neighbors[sender_ip]['metric'] = new_metric
         except: pass
 
-    def handle_flood(self, header, payload, sender_ip_real):
+    '''def handle_flood(self, header, payload, sender_ip_real):
         try:
             data = json.loads(payload.decode('utf-8'))
             stream_id = data['stream_id']
@@ -117,8 +117,61 @@ class OverlayNode:
         if melhorou:
             data['cost'] = novo_custo
             return json.dumps(data).encode('utf-8')
-        return None
+        return None '''
 
+    def handle_flood(self, header, payload, sender_ip_real):
+        try:
+            data = json.loads(payload.decode('utf-8'))
+            stream_id = data['stream_id']
+            custo_recebido = data['cost']
+            origin_seq = data['origin_seq']
+        except: return None
+
+        # Modo Estrito: Ignorar flood de desconhecidos
+        if sender_ip_real not in self.neighbors: return None
+
+        # Verificar duplicados (Loop prevention)
+        lsa_key = (stream_id, origin_seq)
+        if lsa_key in self.lsa_database: return None
+        self.lsa_database[lsa_key] = time.time()
+
+        metric_link = self.neighbors[sender_ip_real]['metric']
+        novo_custo = custo_recebido + metric_link
+
+        # --- AQUI COMEÇA A MUDANÇA CRÍTICA ---
+        should_propagate = False
+        CHANGE_THRESHOLD = 0.15 # 15% de Histerese para evitar oscilação
+
+        if stream_id not in self.routing_table:
+            # Rota nova: Aceitar sempre
+            self.routing_table[stream_id] = RouteEntry(stream_id, sender_ip_real, novo_custo)
+            should_propagate = True
+        else:
+            rota = self.routing_table[stream_id]
+            
+            # CASO 1: Encontrámos um caminho MELHOR (Lower bound)
+            # Só trocamos se for realmente melhor para evitar "flapping" por 1ms
+            if novo_custo < rota.custo_acumulado:
+                rota.proximo_salto_ip = sender_ip_real
+                rota.custo_acumulado = novo_custo
+                should_propagate = True
+            
+            # CASO 2: O caminho ATUAL piorou (Upper bound / Congestionamento)
+            # Se o meu fornecedor atual diz que o custo subiu, eu TENHO de aceitar a má notícia
+            # Mas aplicamos o Threshold para não propagar ruído pequeno
+            elif sender_ip_real == rota.proximo_salto_ip:
+                if novo_custo > rota.custo_acumulado * (1 + CHANGE_THRESHOLD):
+                     rota.custo_acumulado = novo_custo
+                     should_propagate = True
+
+        if should_propagate:
+            data['cost'] = novo_custo
+            # Pequeno Jitter para evitar "Broadcast Storms" síncronas
+            time.sleep(0.005) 
+            return json.dumps(data).encode('utf-8')
+            
+        return None
+    
     def handle_join(self, payload, sender_ip_real):
         """
         Retorna: (upstream_ip, send_ack)

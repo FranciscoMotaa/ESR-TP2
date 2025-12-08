@@ -116,8 +116,9 @@ def get_neighbors_dynamic(tracker_ip, my_id, my_ip):
             return neighbors
         return []
     except Exception as e:
-        print(f"[ERRO] Tracker offline: {e}")
-        sys.exit(1)
+        print(f"[ERRO] Falha ao contactar Tracker: {e}")
+        # Não terminar o nó se o tracker estiver momentaneamente inacessível
+        return []
 
 def main():
     parser = argparse.ArgumentParser()
@@ -163,9 +164,11 @@ def main():
     last_flood = 0
     last_frame = 0
     last_report = 0
+    last_rediscovery = 0
     
     HELLO_INTERVAL = 1.0 
     FLOOD_INTERVAL = 10.0 
+    REDISCOVERY_INTERVAL = 10.0  # Recontactar o tracker periodicamente (heartbeat)
     
     # --- CONTROLO DE CONGESTIONAMENTO ---
     FRAME_INTERVAL = 0.50 # Começa a 20 FPS (0.05s)
@@ -194,6 +197,22 @@ def main():
                 except: pass
 
             now = time.time()
+
+            # --- A. REDISCOVERY / HEARTBEAT: recontactar o tracker periodicamente ---
+            try:
+                if now - last_rediscovery >= REDISCOVERY_INTERVAL:
+                    print(f"[REDISCOVERY] A recontactar tracker...")
+                    new_neighbors = get_neighbors_dynamic(args.tracker, args.node_id, my_ip)
+                    # Adicionar/atualizar vizinhos recebidos
+                    for n in new_neighbors:
+                        if not n or n == my_ip:
+                            continue
+                        if n not in node.neighbors:
+                            node.neighbors[n] = {'metric': 50.0, 'last_seen': 0}
+                            print(f"[REDISCOVERY] Novo vizinho descoberto: {n}")
+                    last_rediscovery = now
+            except Exception as e:
+                print(f"[REDISCOVERY ERRO] {e}")
             
             # --- 1. Retransmissão de JOIN ---
             if join_state['active']:

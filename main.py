@@ -17,7 +17,7 @@ BOOTSTRAP_PORT = 6000
 VIDEO_SOURCE = "trailer_the_boys.mp4" # O vídeo original MP4
 
 # --- CONFIGURAÇÃO FFMPEG ---
-CHUNK_SIZE = 1024  # Tamanho do payload UDP (ajustado para caber no MTU com cabeçalhos)
+CHUNK_SIZE = 700  # Tamanho do payload UDP (ajustado para caber no MTU com cabeçalhos)
 
 class FFmpegStreamer:
     def __init__(self, filename):
@@ -30,11 +30,12 @@ class FFmpegStreamer:
             '-i', filename,
             '-f', 'mpegts',       # Container ideal para stream
             '-c:v', 'mpeg2video', # Codec leve e robusto
-            '-b:v', '400k',       # Bitrate controlado (400kbps)
+            '-b:v', '200k', 
+            '-g', '15',     # Bitrate controlado (400kbps)
             # --- ÁUDIO (NOVO) ---
             # Removemos o '-an' e adicionamos isto:
             '-c:a', 'mp2',      # Codec MP2 (Padrão para MPEG-TS e muito leve)
-            '-b:a', '128k',     # Bitrate baixo (128kbps) para não entupir a rede
+            '-b:a', '64k',     # Bitrate baixo (128kbps) para não entupir a rede
             '-ar', '44100',     # Taxa de amostragem padrão
             '-ac', '2',         # 2 canais (Estéreo)               # Remover áudio (opcional, poupa banda)
             '-'                   # Output para Pipe
@@ -57,12 +58,28 @@ class FFplayPlayer:
         # Comando: Ler do STDIN -> Reproduzir janela
         command = [
             'ffplay',
-            '-f', 'mpegts',       # Força formato de entrada
-            '-framedrop',         # Dropa frames se CPU não aguentar
-            '-infbuf',            # Buffer infinito para não crashar com lag
+            '-f', 'mpegts',
+            
+            # --- 1. Tolerância a Lixo ---
+            '-err_detect', 'ignore_err',
+            '-ec', 'favor_inter',
+            '-fflags', '+genpts+igndts',
+            
+            # --- 2. O GOLPE DE ESTADO (NOVO) ---
+            '-sync', 'video',    # <--- CRÍTICO: O Vídeo manda. Se o áudio morrer, o vídeo continua.
+            
+            # --- 3. Tentativa de Salvar o Áudio ---
+            # Mantemos o filtro para tentar "esticar" o som quando falta, 
+            # mas agora sem travar o vídeo.
+            '-af', 'aresample=async=1',
+            
+            # --- 4. Buffer ---
+            '-infbuf',
+            
             '-window_title', 'Simulacao Overlay',
             '-x', '640', '-y', '480',
-            '-'                   # Input do Pipe
+            '-loglevel', 'error', # <--- Limpa o terminal (esconde os warnings do ALSA)
+            '-'
         ]
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=None)
 
@@ -115,8 +132,8 @@ def main():
     # Configurar Socket UDP
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048576) # 2MB Buffer
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048576)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 5 * 1024 * 1024) # 2MB Buffer
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 5 * 1024 * 1024)
     except: pass
     sock.bind(('0.0.0.0', DEFAULT_PORT))
     sock.setblocking(0)
@@ -223,7 +240,7 @@ def main():
                             
                             # --- Traffic Pacing ---
                             # Fundamental para não afogar a rede overlay
-                            time.sleep(0.005) 
+                            time.sleep(0.001) 
                 elif raw_chunk == b'':
                     print("[FIM] Vídeo terminou.")
                     ffmpeg_source.close()

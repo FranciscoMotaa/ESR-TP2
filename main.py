@@ -7,40 +7,54 @@ import time
 import base64
 import math
 import os
-import subprocess  # <--- CRÍTICO PARA O FFMPEG
+import subprocess
 
 from utils import get_interface_ip
 from overlay_structs import OverlayNode, MsgType, MAX_PACKET_SIZE
 
 DEFAULT_PORT = 50000
 BOOTSTRAP_PORT = 6000
-VIDEO_SOURCE = "trailer_the_boys.mp4" # O vídeo original MP4
+VIDEO_SOURCE = "trailer_the_boys.mp4" 
 
-# --- CONFIGURAÇÃO FFMPEG ---
-CHUNK_SIZE = 700  # Tamanho do payload UDP (ajustado para caber no MTU com cabeçalhos)
+# --- CONFIGURAÇÃO REDE ---
+CHUNK_SIZE = 700  # Tamanho seguro para evitar fragmentação
 
+# --- CLASSE STREAMER COM ABR (ADAPTIVE BITRATE) ---
 class FFmpegStreamer:
-    def __init__(self, filename):
-        print(f"[STREAMER] A iniciar transcodificação de {filename}...")
-        # Comando: Lê ficheiro -> Converte para MPEG-TS (tolerante a perdas) -> Saída STDOUT
+    def __init__(self, filename, quality='HIGH'):
+        self.filename = filename
+        self.current_quality = quality
+        print(f"[STREAMER] A iniciar transcodificação ({quality})...")
+        
+        # --- PERFIS DE QUALIDADE ---
+        if quality == 'HIGH':
+            # Perfil Original: 640x480, 250k video, 128k audio
+            scale = "640:480"
+            v_bitrate = "250k"
+            a_bitrate = "128k"
+        else: # LOW
+            # Perfil de Resgate: 320x240, 100k video, 64k audio (Poupa banda)
+            scale = "320:240"
+            v_bitrate = "100k"
+            a_bitrate = "64k"
+
         command = [
             'ffmpeg',
-            '-re',   
-            '-stream_loop', '-1', # Ler em tempo real (Native framerate)
+            '-re',
+            '-stream_loop', '-1',
             '-i', filename,
-            '-f', 'mpegts',       # Container ideal para stream
-            '-c:v', 'mpeg2video', # Codec leve e robusto
-            '-b:v', '200k', 
-            '-g', '15',     # Bitrate controlado (400kbps)
-            # --- ÁUDIO (NOVO) ---
-            # Removemos o '-an' e adicionamos isto:
-            '-c:a', 'mp2',      # Codec MP2 (Padrão para MPEG-TS e muito leve)
-            '-b:a', '64k',     # Bitrate baixo (128kbps) para não entupir a rede
-            '-ar', '44100',     # Taxa de amostragem padrão
-            '-ac', '2',         # 2 canais (Estéreo)               # Remover áudio (opcional, poupa banda)
-            '-'                   # Output para Pipe
+            '-vf', f'scale={scale}', # Redimensiona dinamicamente
+            '-f', 'mpegts',
+            '-c:v', 'mpeg2video',
+            '-b:v', v_bitrate,
+            '-g', '15',              # Recuperação rápida de imagem
+            '-c:a', 'mp2',
+            '-b:a', a_bitrate,
+            '-ar', '44100',
+            '-ac', '2',
+            '-'
         ]
-        # stderr=subprocess.DEVNULL esconde o lixo do log do ffmpeg
+        # stderr=subprocess.DEVNULL para manter o terminal limpo
         self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     def read_chunk(self, size):
@@ -52,33 +66,30 @@ class FFmpegStreamer:
         if self.process:
             self.process.terminate()
 
+# --- CLASSE PLAYER ROBUSTO ---
 class FFplayPlayer:
     def __init__(self):
         print("[PLAYER] A iniciar ffplay...")
-        # Comando: Ler do STDIN -> Reproduzir janela
         command = [
             'ffplay',
             '-f', 'mpegts',
             
-            # --- 1. Tolerância a Lixo ---
+            # --- Tolerância a Falhas ---
             '-err_detect', 'ignore_err',
             '-ec', 'favor_inter',
             '-fflags', '+genpts+igndts',
             
-            # --- 2. O GOLPE DE ESTADO (NOVO) ---
-            '-sync', 'video',    # <--- CRÍTICO: O Vídeo manda. Se o áudio morrer, o vídeo continua.
+            # --- Sincronização & Áudio ---
+            '-sync', 'video',           # Vídeo é Mestre (não trava por causa do som)
+            '-af', 'aresample=async=1', # Corrige "underrun" do ALSA
             
-            # --- 3. Tentativa de Salvar o Áudio ---
-            # Mantemos o filtro para tentar "esticar" o som quando falta, 
-            # mas agora sem travar o vídeo.
-            '-af', 'aresample=async=1',
+            # --- Performance ---
+            '-infbuf',                  # Buffer infinito para suavidade
+            '-framedrop',               
             
-            # --- 4. Buffer ---
-            '-infbuf',
-            
-            '-window_title', 'Simulacao Overlay',
+            '-window_title', 'Streamer 1',
             '-x', '640', '-y', '480',
-            '-loglevel', 'error', # <--- Limpa o terminal (esconde os warnings do ALSA)
+            '-loglevel', 'error',       # Esconde avisos chatos do ALSA
             '-'
         ]
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=None)
@@ -129,49 +140,44 @@ def main():
     for neighbor_ip in initial_neighbors:
         node.neighbors[neighbor_ip] = {'metric': 50.0, 'last_seen': 0}
 
-    # Configurar Socket UDP
+    # Configurar Socket UDP (Buffer Gigante)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 5 * 1024 * 1024) # 2MB Buffer
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 5 * 1024 * 1024)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 5 * 1024 * 1024)
     except: pass
     sock.bind(('0.0.0.0', DEFAULT_PORT))
     sock.setblocking(0)
 
-    # --- INICIALIZAÇÃO DOS COMPONENTES FFMPEG ---
+    # --- INICIALIZAÇÃO DOS COMPONENTES ---
     ffmpeg_source = None
     ffplay_sink = None
 
-    # Se for STREAMER, prepara a fonte
     if "STREAMER" in args.node_id:
         if os.path.exists(VIDEO_SOURCE):
-            ffmpeg_source = FFmpegStreamer(VIDEO_SOURCE)
+            # Inicia em Alta Qualidade por defeito
+            ffmpeg_source = FFmpegStreamer(VIDEO_SOURCE, quality='HIGH')
         else:
             print(f"[ERRO] Vídeo '{VIDEO_SOURCE}' não encontrado!")
 
-    # Se for CLIENTE, prepara o player (Sink)
     if "C" in args.node_id:
         ffplay_sink = FFplayPlayer()
 
     # Variáveis de Estado
-    join_state = {
-        'active': False, 
-        'stream_id': None, 
-        'target_ip': None, 
-        'last_sent': 0, 
-        'retries': 0
-    }
+    join_state = {'active': False, 'stream_id': None, 'target_ip': None, 'last_sent': 0, 'retries': 0}
     
     last_hello = 0
     last_flood = 0
+    last_report = 0        # <--- FALTAVA ISTO NO TEU SNIPPET
     
     HELLO_INTERVAL = 1.0 
-    FLOOD_INTERVAL = 10.0 # Flood mais frequente para atualizar rotas rápido
+    FLOOD_INTERVAL = 10.0 
     JOIN_TIMEOUT = 5.0
 
     inputs = [sock, sys.stdin]
     frame_seq = 0
     stats_frames_received = 0
+    stats_frames_lost = 0  # <--- FALTAVA ISTO NO TEU SNIPPET
 
     print("[*] Sistema pronto. Comandos: 'join <STREAM_ID>', 'leave <STREAM_ID>', 'status'.")
     
@@ -201,32 +207,49 @@ def main():
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
                 last_hello = now
 
-            # --- 3. Flood (OSPF-like) ---
+            # --- 3. Flood (Routing) ---
             if "STREAMER" in args.node_id and now - last_flood >= FLOOD_INTERVAL:
                 flood_payload = json.dumps({
                     "stream_id": args.node_id,
                     "cost": 0,
                     "origin_seq": int(now)
                 }).encode('utf-8')
-                # print(f"[📢] Flood (Seq {int(now)})...") 
                 for n_ip in node.neighbors:
                     pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload)
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
                 last_flood = now
 
-            # --- 4. ENVIO DE VÍDEO (STREAMER) ---
+            # --- 4. Envio de Relatórios QoS (CLIENTE) ---
+            if "C" in args.node_id and now - last_report >= 2.0:
+                if stats_frames_received > 0:
+                    total = stats_frames_received + stats_frames_lost
+                    loss_rate = (stats_frames_lost / total * 100.0) if total > 0 else 0.0
+                    
+                    # DICA DE TESTE: Para testar a troca de qualidade, podes descomentar:
+                    # loss_rate = 15.0 
+
+                    if join_state['stream_id'] and join_state['target_ip']:
+                         report_payload = json.dumps({
+                             "stream_id": join_state['stream_id'], 
+                             "client_id": args.node_id, 
+                             "loss_rate": loss_rate
+                         }).encode('utf-8')
+                         pkt = node.pack_message(MsgType.STREAM_REPORT, join_state['target_ip'], report_payload)
+                         sock.sendto(pkt, (join_state['target_ip'], DEFAULT_PORT))
+                         
+                         stats_frames_received = 0
+                         stats_frames_lost = 0
+                last_report = now
+
+            # --- 5. ENVIO DE VÍDEO (STREAMER) ---
             if ffmpeg_source:
-                # Lê um pedaço do ffmpeg
                 raw_chunk = ffmpeg_source.read_chunk(CHUNK_SIZE)
-                
                 if raw_chunk and len(raw_chunk) > 0:
                     frame_seq += 1
-                    # Codifica para enviar no JSON
                     b64_data = base64.b64encode(raw_chunk).decode('utf-8')
                     
                     if args.node_id in node.routing_table:
                         clients = node.routing_table[args.node_id].downstream_ips
-                        
                         if clients:
                             payload = json.dumps({
                                 "id": args.node_id, 
@@ -238,9 +261,7 @@ def main():
                                 pkt = node.pack_message(MsgType.STREAM_DATA, client_ip, payload)
                                 sock.sendto(pkt, (client_ip, DEFAULT_PORT))
                             
-                            # --- Traffic Pacing ---
-                            # Fundamental para não afogar a rede overlay
-                            time.sleep(0.001) 
+                            time.sleep(0.001) # Pacing rápido
                 elif raw_chunk == b'':
                     print("[FIM] Vídeo terminou.")
                     ffmpeg_source.close()
@@ -263,8 +284,7 @@ def main():
                         header, payload = node.unpack_message(data)
                         if not header: continue
 
-                        # --- PROCESSAMENTO DE MENSAGENS ---
-
+                        # --- PROCESSAMENTO ---
                         if header['type'] == MsgType.HELLO:
                             resp = node.handle_hello(header, sender_ip_real)
                             pkt = node.pack_message(MsgType.HELLO_RESPONSE, sender_ip_real, resp)
@@ -283,7 +303,6 @@ def main():
 
                         elif header['type'] == MsgType.STREAM_JOIN:
                             upstream_ip, send_ack = node.handle_join(payload, sender_ip_real)
-                            
                             if send_ack:
                                 try:
                                     jdata = json.loads(payload.decode('utf-8'))
@@ -293,9 +312,8 @@ def main():
                                     sock.sendto(ack_pkt, (sender_ip_real, DEFAULT_PORT))
                                 except: pass
 
-                            # Propagar JOIN para cima se necessário
                             if upstream_ip and upstream_ip != "SOURCE":
-                                # Verifica se já estamos a servir, para não duplicar JOINs
+                                # Verifica se já serve para evitar loops de JOIN
                                 is_serving = False
                                 try:
                                     jdata = json.loads(payload.decode('utf-8'))
@@ -303,15 +321,13 @@ def main():
                                     if sid in node.routing_table and len(node.routing_table[sid].downstream_ips) > 1:
                                         is_serving = True
                                 except: pass
-
                                 if not is_serving:
                                     pkt = node.pack_message(MsgType.STREAM_JOIN, upstream_ip, payload)
                                     sock.sendto(pkt, (upstream_ip, DEFAULT_PORT))
-                                    print(f"[⬆️] JOIN propagado -> {upstream_ip}")
 
                         elif header['type'] == MsgType.ACK_JOIN:
                             if join_state['active']:
-                                print(f"[✅] ACK recebido! Stream a caminho.")
+                                print(f"[✅] ACK recebido! Ligação OK.")
                                 join_state['active'] = False 
 
                         elif header['type'] == MsgType.STREAM_LEAVE:
@@ -320,32 +336,54 @@ def main():
                                 pkt = node.pack_message(MsgType.STREAM_LEAVE, upstream_prune, payload)
                                 sock.sendto(pkt, (upstream_prune, DEFAULT_PORT))
 
-                        # --- RECEÇÃO DE DADOS (CÓDIGO SUBSTITUÍDO AQUI) ---
+                        # --- ADAPTIVE BITRATE LOGIC ---
+                        elif header['type'] == MsgType.STREAM_REPORT:
+                            # 1. Router: Encaminhar
+                            upstream_report = node.handle_report(payload, sender_ip_real)
+                            if upstream_report and upstream_report != "SOURCE":
+                                pkt = node.pack_message(MsgType.STREAM_REPORT, upstream_report, payload)
+                                sock.sendto(pkt, (upstream_report, DEFAULT_PORT))
+                            
+                            # 2. Streamer: Decidir Qualidade
+                            elif upstream_report == "SOURCE" and ffmpeg_source:
+                                try:
+                                    info = json.loads(payload.decode('utf-8'))
+                                    loss = info.get('loss_rate', 0.0)
+                                    
+                                    if loss > 10.0 and ffmpeg_source.current_quality == 'HIGH':
+                                        print(f"\n[⚠️] CONGESTIONAMENTO (Perda: {loss:.1f}%) -> LOW PROFILE")
+                                        ffmpeg_source.close()
+                                        ffmpeg_source = FFmpegStreamer(VIDEO_SOURCE, quality='LOW')
+                                    
+                                    elif loss < 2.0 and ffmpeg_source.current_quality == 'LOW':
+                                        print(f"\n[🚀] REDE RECUPERADA (Perda: {loss:.1f}%) -> HIGH PROFILE")
+                                        ffmpeg_source.close()
+                                        ffmpeg_source = FFmpegStreamer(VIDEO_SOURCE, quality='HIGH')
+                                except Exception as e: print(f"Erro ABR: {e}")
+
+                        # --- VÍDEO DATA ---
                         elif header['type'] == MsgType.STREAM_DATA:
                             try:
                                 info = json.loads(payload.decode('utf-8'))
                                 s_id = info.get('id')
                                 
-                                # 1. Forwarding (Se for Router)
+                                # Router: Forwarding
                                 if s_id in node.routing_table:
                                     for child in node.routing_table[s_id].downstream_ips:
                                         if child != sender_ip_real:
                                             pkt = node.pack_message(MsgType.STREAM_DATA, child, payload)
                                             sock.sendto(pkt, (child, DEFAULT_PORT))
                                 
-                                # 2. Consumo (Se for Cliente e tiver Player ativo)
+                                # Cliente: Play
                                 if ffplay_sink:
                                     b64_data = info.get('data')
                                     raw_data = base64.b64decode(b64_data)
                                     ffplay_sink.write_data(raw_data)
-                                    
-                                    # Stats simples
                                     stats_frames_received += 1
                                     if stats_frames_received % 100 == 0:
                                         print(f"\r[FF] Packets RX: {stats_frames_received}", end="")
 
-                            except Exception as e: 
-                                print(f"Erro decode: {e}")
+                            except Exception as e: pass
                         
                         if packet_count > 100: break
 

@@ -25,12 +25,18 @@ class FFmpegStreamer:
         # Comando: Lê ficheiro -> Converte para MPEG-TS (tolerante a perdas) -> Saída STDOUT
         command = [
             'ffmpeg',
-            '-re',                # Ler em tempo real (Native framerate)
+            '-re',   
+            '-stream_loop', '-1', # Ler em tempo real (Native framerate)
             '-i', filename,
             '-f', 'mpegts',       # Container ideal para stream
             '-c:v', 'mpeg2video', # Codec leve e robusto
             '-b:v', '400k',       # Bitrate controlado (400kbps)
-            '-an',                # Remover áudio (opcional, poupa banda)
+            # --- ÁUDIO (NOVO) ---
+            # Removemos o '-an' e adicionamos isto:
+            '-c:a', 'mp2',      # Codec MP2 (Padrão para MPEG-TS e muito leve)
+            '-b:a', '128k',     # Bitrate baixo (128kbps) para não entupir a rede
+            '-ar', '44100',     # Taxa de amostragem padrão
+            '-ac', '2',         # 2 canais (Estéreo)               # Remover áudio (opcional, poupa banda)
             '-'                   # Output para Pipe
         ]
         # stderr=subprocess.DEVNULL esconde o lixo do log do ffmpeg

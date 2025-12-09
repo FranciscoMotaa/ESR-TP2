@@ -177,8 +177,19 @@ def display_monitor():
                 last_conn = datetime.fromtimestamp(info['last_seen']).strftime('%H:%M:%S')
                 time_elapsed = f"{int(last_seen_seconds)}s" if last_seen_seconds < 60 else f"{int(last_seen_seconds/60)}m"
                 neighbors = info.get('neighbors', {})
-                # Mostrar todos vizinhos recebidos
-                neighbors_str = ', '.join(sorted(neighbors.keys())) if neighbors else "-"
+                
+                # Mostrar apenas vizinhos que estão realmente ativos (iniciados e vivos)
+                active_neighbors = []
+                for neighbor_ip in neighbors.keys():
+                    # Verificar se este IP pertence a algum nó que está no node_state e está vivo
+                    for other_node_id, other_info in node_state.items():
+                        if other_info['ip'] == neighbor_ip:
+                            other_last_seen = now - other_info['last_seen']
+                            if other_last_seen < 30:  # Considerado vivo se < 30s
+                                active_neighbors.append(neighbor_ip)
+                            break
+                
+                neighbors_str = ', '.join(sorted(active_neighbors)) if active_neighbors else "-"
                 print(f"{node_id:<10} {status:<7} {last_conn:<16} {time_elapsed:<8} {neighbors_str:<40}")
             
             # Tabela de rotas (layout limpo)

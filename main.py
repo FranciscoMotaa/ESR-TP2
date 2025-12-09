@@ -108,21 +108,29 @@ def get_neighbors_dynamic(tracker_ip, my_id, my_ip):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3.0) 
+        print(f"[*] Tentando conectar ao tracker {tracker_ip}:{BOOTSTRAP_PORT} para registar {my_id} ({my_ip})")
         sock.connect((tracker_ip, BOOTSTRAP_PORT))
         request = json.dumps({"id": my_id, "ip": my_ip})
         sock.send(request.encode('utf-8'))
         data = sock.recv(4096)
-        response = json.loads(data.decode('utf-8'))
+        try:
+            raw = data.decode('utf-8')
+        except:
+            raw = str(data)
+        print(f"[*] Resposta bruta do tracker: {raw}")
+        response = json.loads(raw)
         sock.close()
-        
+
         if response.get("status") == "OK":
             neighbors = response.get("neighbors", [])
             print(f"[*] Tracker: Vizinhos atribuídos -> {neighbors}")
             return neighbors
+        print("[WARN] Tracker retornou status != OK")
         return []
     except Exception as e:
-        print(f"[ERRO] Tracker offline: {e}")
-        sys.exit(1)
+        print(f"[ERRO] Falha ao contactar tracker {tracker_ip}:{BOOTSTRAP_PORT}: {e}")
+        # Não terminar o processo; devolver lista vazia para permitir funcionamento offline
+        return []
 
 def main():
     parser = argparse.ArgumentParser()
@@ -318,6 +326,27 @@ def main():
                         except Exception: break
                         
                         sender_ip_real = addr[0]
+                        
+                        # Verificar se é uma notificação do bootstrapper (JSON puro, sem header overlay)
+                        try:
+                            notification = json.loads(data.decode('utf-8'))
+                            if notification.get('type') == 'neighbor_update':
+                                new_neighbor_ip = notification.get('new_neighbor')
+                                new_neighbor_id = notification.get('neighbor_id')
+                                if new_neighbor_ip and new_neighbor_ip not in node.neighbors:
+                                    # Adicionar novo vizinho dinamicamente
+                                    node.neighbors[new_neighbor_ip] = {
+                                        'metric': 50.0,  # Métrica inicial
+                                        'last_seen': time.time()
+                                    }
+                                    print(f"\n NOVO VIZINHO: {new_neighbor_id} ({new_neighbor_ip}) adicionado dinamicamente!")
+                                    
+                                    # Enviar HELLO imediatamente para estabelecer conexão
+                                    pkt = node.pack_message(MsgType.HELLO, new_neighbor_ip, b"")
+                                    sock.sendto(pkt, (new_neighbor_ip, DEFAULT_PORT))
+                                continue
+                        except: pass
+                        
                         header, payload = node.unpack_message(data)
                         if not header: continue
 
@@ -393,7 +422,7 @@ def main():
                                         ffmpeg_source = FFmpegStreamer(VIDEO_SOURCE, quality='LOW')
                                     
                                     elif loss < 2.0 and ffmpeg_source.current_quality == 'LOW':
-                                        print(f"\n[🚀] REDE RECUPERADA (Perda: {loss:.1f}%) -> HIGH PROFILE")
+                                        print(f"\nREDE RECUPERADA (Perda: {loss:.1f}%) -> HIGH PROFILE")
                                         ffmpeg_source.close()
                                         ffmpeg_source = FFmpegStreamer(VIDEO_SOURCE, quality='HIGH')
                                 except Exception as e: print(f"Erro ABR: {e}")

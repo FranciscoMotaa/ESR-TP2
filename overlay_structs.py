@@ -140,7 +140,7 @@ class OverlayNode:
 
         # --- AQUI COMEÇA A MUDANÇA CRÍTICA ---
         should_propagate = False
-        CHANGE_THRESHOLD = 0.15 # 15% de Histerese para evitar oscilação
+        CHANGE_THRESHOLD = 0.05 # 5% de Histerese (reduzido para aceitar mais caminhos)
 
         if stream_id not in self.routing_table:
             # Rota nova: Aceitar sempre
@@ -149,20 +149,28 @@ class OverlayNode:
         else:
             rota = self.routing_table[stream_id]
             
-            # CASO 1: Encontrámos um caminho MELHOR (Lower bound)
-            # Só trocamos se for realmente melhor para evitar "flapping" por 1ms
-            if novo_custo < rota.custo_acumulado:
+            # CASO 1: Encontrámos um caminho MELHOR (mesmo que ligeiramente)
+            # Aceitar se for melhor, considerando threshold para evitar oscilação
+            if novo_custo < rota.custo_acumulado * (1 - CHANGE_THRESHOLD):
+                print(f"[{self.node_id}] 🔄 Caminho MELHOR para {stream_id}: {sender_ip_real} (custo {novo_custo:.2f} < {rota.custo_acumulado:.2f})")
                 rota.proximo_salto_ip = sender_ip_real
                 rota.custo_acumulado = novo_custo
                 should_propagate = True
             
             # CASO 2: O caminho ATUAL piorou (Upper bound / Congestionamento)
-            # Se o meu fornecedor atual diz que o custo subiu, eu TENHO de aceitar a má notícia
-            # Mas aplicamos o Threshold para não propagar ruído pequeno
+            # Se o meu fornecedor atual diz que o custo subiu, aceitar
             elif sender_ip_real == rota.proximo_salto_ip:
                 if novo_custo > rota.custo_acumulado * (1 + CHANGE_THRESHOLD):
+                     print(f"[{self.node_id}] ⚠️  Caminho PIOROU para {stream_id}: custo {novo_custo:.2f} > {rota.custo_acumulado:.2f}")
                      rota.custo_acumulado = novo_custo
                      should_propagate = True
+            
+            # CASO 3: Caminho alternativo competitivo (novo!)
+            # Aceitar caminhos alternativos que sejam razoavelmente bons
+            elif novo_custo <= rota.custo_acumulado * (1 + CHANGE_THRESHOLD * 2):
+                print(f"[{self.node_id}] 🔀 Caminho ALTERNATIVO para {stream_id}: {sender_ip_real} (custo {novo_custo:.2f} vs atual {rota.custo_acumulado:.2f})")
+                # Não mudamos a rota principal, mas propagamos para dar visibilidade
+                should_propagate = True
 
         if should_propagate:
             data['cost'] = novo_custo

@@ -10,30 +10,51 @@ from collections import defaultdict
 BIND_IP = "0.0.0.0"
 BIND_PORT = 6000
 MONITOR_PORT = 6001  # Porta UDP para receber updates de estado
-TOPOLOGY_FILE = "bootstrap_conf.json"
-static_topology = {}
+NODE_DEFAULT_PORT = 50000 # Porta que os nós usam para comunicação (e receber notificações)
 
 # Estruturas de dados para monitorização
-node_state = {}  # {node_id: {'ip': ..., 'last_seen': ..., 'neighbors': {...}, 'routing_table': {...}, 'streams': [...]}}
-route_history = {}  # Histórico de mudanças de rotas: {node_id: {dest_id: [(timestamp, next_hop, cost), ...]}}
-neighbor_discovery = {}  # Rastreio de descoberta de vizinhos: {node_id: {neighbor_ip: first_seen_timestamp}}
+# node_state: {node_id: {'ip': ..., 'last_seen': ..., 'neighbors': {...}, 'routing_table': {...}, 'streams': [...]}}
+node_state = {} 
+route_history = {} 
+neighbor_discovery = {} 
 state_lock = threading.Lock()
 
 def load_topology():
-    global static_topology
-    try:
-        with open(TOPOLOGY_FILE, 'r') as f:
-            data = json.load(f)
-            for node in data.get("nodes", []):
-                node_id = node["id"]
-                neighbors = node["neighbors"]
-                static_topology[node_id] = neighbors
-        print(f"[*] Topologia carregada: {len(static_topology)} nós configurados.")
-    except Exception as e:
-        print(f"[ERRO] Falha ao carregar {TOPOLOGY_FILE}: {e}")
-        sys.exit(1)
+    """Inicializa o Tracker em modo dinâmico."""
+    # Nenhuma topologia estática é carregada.
+    print("[*] Tracker inicializado. Descoberta de vizinhos dinâmica ativa.")
+    pass
+
+def notify_new_node(new_node_id, new_node_ip):
+    """Notifica todos os nós ativos sobre a entrada de um novo nó."""
+    
+    notification = json.dumps({
+        "type": "neighbor_update",
+        "new_neighbor": new_node_ip,
+        "neighbor_id": new_node_id
+    }).encode('utf-8')
+
+    print(f"[*] A notificar todos os nós ativos sobre o novo nó {new_node_id} ({new_node_ip}).")
+    
+    with state_lock:
+        # Iterar sobre todos os nós já registados (exceto o próprio)
+        for other_node_id, info in node_state.items():
+            if other_node_id != new_node_id:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.settimeout(0.5)
+                    
+                    other_ip = info['ip']
+                    # Enviar notificação para a porta padrão de comunicação do nó (50000)
+                    sock.sendto(notification, (other_ip, NODE_DEFAULT_PORT))
+                    sock.close()
+                    
+                except Exception:
+                    # Falha ao notificar um nó (pode estar offline ou inacessível)
+                    pass
 
 def handle_client(client_sock, addr):
+    """Lida com pedidos de registo TCP (Bootstrapping Dinâmico)."""
     try:
         data = client_sock.recv(1024)
         if not data: return
@@ -42,19 +63,18 @@ def handle_client(client_sock, addr):
         node_id = request.get('id')
         node_ip = request.get('ip') 
         
-        print(f"[TRACKER] Pedido de registo de {node_id} ({node_ip})")
+        print(f"[TRACKER] Pedido de registo dinâmico de {node_id} ({node_ip})")
         
         response_neighbors = []
+        is_new_registration = False
         
-        # Modo Determinístico: Ler do JSON
-        if node_id in static_topology:
-            response_neighbors = static_topology[node_id]
-            print(f"   -> Vizinhos definidos no JSON: {response_neighbors}")
-        else:
-            print(f"   -> [AVISO] Nó {node_id} não encontrado no JSON. Devolvendo lista vazia.")
-
-        # Registar nó no estado
         with state_lock:
+            # 1. Obter a lista de *todos* os IPs de nós já ativos
+            # Estes IPs serão os vizinhos iniciais para o novo nó.
+            all_active_ips = [info['ip'] for n_id, info in node_state.items() if n_id != node_id]
+            response_neighbors = all_active_ips
+            
+            # 2. Registar/Atualizar nó no estado
             if node_id not in node_state:
                 node_state[node_id] = {
                     'ip': node_ip,
@@ -63,9 +83,20 @@ def handle_client(client_sock, addr):
                     'routing_table': {},
                     'streams': []
                 }
-
+                is_new_registration = True
+                print(f"   -> Novo nó {node_id} registado. Devolvendo {len(all_active_ips)} vizinhos iniciais.")
+            else:
+                # Atualizar IP e last_seen em caso de reconexão
+                node_state[node_id]['ip'] = node_ip
+                node_state[node_id]['last_seen'] = time.time()
+                
+        # 3. Enviar a lista de vizinhos (IPs dos nós ativos) ao novo nó
         response = json.dumps({"status": "OK", "neighbors": response_neighbors})
         client_sock.send(response.encode('utf-8'))
+        
+        # 4. Notificar a rede sobre o novo nó (após enviar resposta)
+        if is_new_registration:
+            threading.Thread(target=notify_new_node, args=(node_id, node_ip), daemon=True).start()
 
     except Exception as e:
         print(f"[ERRO] {e}")
@@ -73,7 +104,7 @@ def handle_client(client_sock, addr):
         client_sock.close()
 
 def handle_state_update(sock):
-    """Recebe updates de estado dos nós via UDP"""
+    """Recebe updates de estado dos nós via UDP."""
     while True:
         try:
             data, addr = sock.recvfrom(8192)
@@ -84,6 +115,7 @@ def handle_state_update(sock):
                 continue
             
             with state_lock:
+                # Inicializar estruturas para um nó recém-visto (se o TCP falhou ou foi ignorado)
                 if node_id not in node_state:
                     node_state[node_id] = {
                         'ip': addr[0],
@@ -97,14 +129,16 @@ def handle_state_update(sock):
                 
                 current_time = time.time()
                 
-                # Detectar novos vizinhos (descoberta dinâmica) - silencioso por padrão
+                # O restante da lógica de monitorização de estado permanece igual
+                
+                # Detectar novos vizinhos (descoberta dinâmica)
                 new_neighbors = update.get('neighbors', {})
                 if node_id in neighbor_discovery:
                     for neighbor_ip in new_neighbors:
                         if neighbor_ip not in neighbor_discovery[node_id]:
                             neighbor_discovery[node_id][neighbor_ip] = current_time
                 
-                # Detectar mudanças de rotas
+                # Detectar mudanças de rotas e logar (código inalterado)
                 new_routing_table = update.get('routing_table', {})
                 old_routing_table = node_state[node_id].get('routing_table', {})
                 
@@ -112,48 +146,46 @@ def handle_state_update(sock):
                     new_next_hop = new_route.get('next_hop')
                     new_cost = new_route.get('cost', 0)
                     
-                    # Inicializar histórico se não existir
                     if node_id not in route_history:
                         route_history[node_id] = {}
                     if dest_id not in route_history[node_id]:
                         route_history[node_id][dest_id] = []
                     
-                    # Verificar se houve mudança
                     if dest_id in old_routing_table:
                         old_next_hop = old_routing_table[dest_id].get('next_hop')
                         old_cost = old_routing_table[dest_id].get('cost', 0)
                         
-                        # Mudança de rota (next hop diferente) - mostrar apenas se significativo
+                        # Logar mudanças de next_hop
                         if new_next_hop != old_next_hop:
                             route_history[node_id][dest_id].append((current_time, new_next_hop, new_cost))
                             cost_diff = new_cost - old_cost
-                            if abs(cost_diff) > 10.0:  # Apenas mudanças >10ms
+                            if abs(cost_diff) > 10.0:
                                 indicator = "↓" if cost_diff < 0 else "↑"
-                                print(f"[{node_id}] {dest_id}: {old_next_hop}({old_cost:.0f}ms) → {new_next_hop}({new_cost:.0f}ms) [{indicator}{abs(cost_diff):.0f}ms]")
-                        # Mesma rota mas custo mudou muito (>15ms)
+                                print(f"[{node_id}] ROTA p/ {dest_id}: {old_next_hop}({old_cost:.0f}ms) → {new_next_hop}({new_cost:.0f}ms) [{indicator}{abs(cost_diff):.0f}ms]")
+                        # Logar grandes mudanças de custo na mesma rota
                         elif abs(new_cost - old_cost) > 15.0:
                             route_history[node_id][dest_id].append((current_time, new_next_hop, new_cost))
                             cost_diff = new_cost - old_cost
                             indicator = "↓" if cost_diff < 0 else "↑"
-                            print(f"[{node_id}] {dest_id} custo: {old_cost:.0f}ms → {new_cost:.0f}ms [{indicator}{abs(cost_diff):.0f}ms]")
+                            print(f"[{node_id}] CUSTO p/ {dest_id}: {old_cost:.0f}ms → {new_cost:.0f}ms [{indicator}{abs(cost_diff):.0f}ms]")
                     else:
-                        # Nova rota descoberta - apenas log inicial
+                        # Nova rota descoberta
                         route_history[node_id][dest_id].append((current_time, new_next_hop, new_cost))
                 
-                # Atualizar dados
+                # Atualizar dados principais
                 node_state[node_id]['last_seen'] = current_time
                 node_state[node_id]['neighbors'] = new_neighbors
                 node_state[node_id]['routing_table'] = new_routing_table
                 node_state[node_id]['streams'] = update.get('streams', [])
                 
         except Exception as e:
-            print(f"[ERRO] Update: {e}")
+            # print(f"[ERRO] Update: {e}")
             pass
 
 def display_monitor():
-    """Thread que mostra tabelas de estado periodicamente"""
+    """Thread que mostra tabelas de estado periodicamente."""
     while True:
-        time.sleep(3)  # Atualizar a cada 3 segundos
+        time.sleep(3)
         
         with state_lock:
             if not node_state:
@@ -167,32 +199,31 @@ def display_monitor():
             print(f"MONITORIZAÇÃO OVERLAY NETWORK - {datetime.now().strftime('%H:%M:%S')}")
             print("=" * 120)
             
-            # Tabela de nós ativos (layout limpo)
+            # Tabela de nós ativos
             print("\nNÓS ATIVOS:")
             print(f"{'ID':<10} {'Estado':<7} {'Última Conexão':<16} {'Tempo':<8} {'Vizinhos Ativos':<40}")
             for node_id in sorted(node_state.keys()):
                 info = node_state[node_id]
                 last_seen_seconds = now - info['last_seen']
-                status = "ALIVE" if last_seen_seconds < 10 else ("LOST" if last_seen_seconds < 30 else "DEAD")
+                status = "🟢 ALIVE" if last_seen_seconds < 10 else ("🟡 LOST" if last_seen_seconds < 30 else "🔴 DEAD")
                 last_conn = datetime.fromtimestamp(info['last_seen']).strftime('%H:%M:%S')
                 time_elapsed = f"{int(last_seen_seconds)}s" if last_seen_seconds < 60 else f"{int(last_seen_seconds/60)}m"
                 neighbors = info.get('neighbors', {})
                 
-                # Mostrar apenas vizinhos que estão realmente ativos (iniciados e vivos)
                 active_neighbors = []
                 for neighbor_ip in neighbors.keys():
                     # Verificar se este IP pertence a algum nó que está no node_state e está vivo
                     for other_node_id, other_info in node_state.items():
-                        if other_info['ip'] == neighbor_ip:
+                        if other_info.get('ip') == neighbor_ip:
                             other_last_seen = now - other_info['last_seen']
-                            if other_last_seen < 30:  # Considerado vivo se < 30s
-                                active_neighbors.append(neighbor_ip)
+                            if other_last_seen < 30: 
+                                active_neighbors.append(other_node_id) # Mostrar ID em vez de IP
                             break
                 
                 neighbors_str = ', '.join(sorted(active_neighbors)) if active_neighbors else "-"
                 print(f"{node_id:<10} {status:<7} {last_conn:<16} {time_elapsed:<8} {neighbors_str:<40}")
             
-            # Tabela de rotas (layout limpo)
+            # Tabela de rotas
             print("\nTABELA DE ROTAS:")
             print(f"{'Nó':<10} {'Destino':<12} {'Próx. Salto':<16} {'Custo':<8} {'Downstream':<10}")
             for node_id in sorted(node_state.keys()):
@@ -224,10 +255,11 @@ def display_monitor():
             print("\n[Pressione Ctrl+C para parar o tracker]")
 
 def start_tracker():
-    load_topology()
+    load_topology() # Inicializa o modo dinâmico
     
     # Servidor TCP para bootstrap
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Permite reuso rápido do endereço
     server.bind((BIND_IP, BIND_PORT))
     server.listen(5)
     print(f"[*] Bootstrapper TCP a correr em {BIND_IP}:{BIND_PORT}")
@@ -241,11 +273,15 @@ def start_tracker():
     threading.Thread(target=handle_state_update, args=(monitor_sock,), daemon=True).start()
     threading.Thread(target=display_monitor, daemon=True).start()
     
-    print(f"[*] Sistema de monitorização ativo. Aguardando updates dos nós...")
+    print(f"[*] Sistema de monitorização ativo. Aguardando registo e updates dos nós...")
     
     while True:
-        client, addr = server.accept()
-        threading.Thread(target=handle_client, args=(client, addr), daemon=True).start()
+        try:
+            client, addr = server.accept()
+            threading.Thread(target=handle_client, args=(client, addr), daemon=True).start()
+        except KeyboardInterrupt:
+            # Captura no loop principal
+            raise
 
 if __name__ == "__main__":
     try:

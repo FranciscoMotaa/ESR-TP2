@@ -14,6 +14,7 @@ from overlay_structs import OverlayNode, MsgType, MAX_PACKET_SIZE
 
 DEFAULT_PORT = 50000
 BOOTSTRAP_PORT = 6000
+MONITOR_PORT = 6001  # Porta UDP do tracker para monitorização
 VIDEO_SOURCE = "trailer_the_boys.mp4" 
 
 # --- CONFIGURAÇÃO REDE ---
@@ -169,10 +170,12 @@ def main():
     last_hello = 0
     last_flood = 0
     last_report = 0        # <--- FALTAVA ISTO NO TEU SNIPPET
+    last_monitor_update = 0  # Para enviar updates ao tracker
     
     HELLO_INTERVAL = 1.0 
     FLOOD_INTERVAL = 10.0 
     JOIN_TIMEOUT = 5.0
+    MONITOR_UPDATE_INTERVAL = 2.0  # Enviar estado ao tracker a cada 2s
 
     inputs = [sock, sys.stdin]
     frame_seq = 0
@@ -218,6 +221,40 @@ def main():
                     pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload)
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
                 last_flood = now
+
+            # --- 3.5. Enviar update de estado ao tracker ---
+            if now - last_monitor_update >= MONITOR_UPDATE_INTERVAL:
+                try:
+                    # Preparar dados de estado
+                    routing_table_data = {}
+                    for stream_id, route_entry in node.routing_table.items():
+                        routing_table_data[stream_id] = {
+                            'next_hop': route_entry.proximo_salto_ip,
+                            'cost': route_entry.custo_acumulado,
+                            'downstream': list(route_entry.downstream_ips)
+                        }
+                    
+                    neighbors_data = {}
+                    for n_ip, n_info in node.neighbors.items():
+                        neighbors_data[n_ip] = {
+                            'metric': n_info.get('metric', 0),
+                            'last_seen': n_info.get('last_seen', 0)
+                        }
+                    
+                    # Streams ativos (ou participando)
+                    active_streams = list(node.routing_table.keys())
+                    
+                    state_update = json.dumps({
+                        'node_id': args.node_id,
+                        'neighbors': neighbors_data,
+                        'routing_table': routing_table_data,
+                        'streams': active_streams
+                    }).encode('utf-8')
+                    
+                    sock.sendto(state_update, (args.tracker, MONITOR_PORT))
+                    last_monitor_update = now
+                except Exception as e:
+                    pass  # Silenciosamente ignorar erros de monitorização
 
             # --- 4. Envio de Relatórios QoS (CLIENTE) ---
             if "C" in args.node_id and now - last_report >= 2.0:

@@ -167,83 +167,30 @@ def display_monitor():
             print(f"MONITORIZAÇÃO OVERLAY NETWORK - {datetime.now().strftime('%H:%M:%S')}")
             print("=" * 120)
             
-            # Tabela de nós ativos
-            print("\n┌─── NÓS ATIVOS " + "─" * 103 + "┐")
-            print(f"│ {'ID':<12} │ {'Estado':<7} │ {'Última Conexão':<16} │ {'Tempo Decorrido':<17} │ {'Vizinhos Ativos':<40} │")
-            print("├" + "─" * 14 + "┼" + "─" * 9 + "┼" + "─" * 18 + "┼" + "─" * 19 + "┼" + "─" * 42 + "┤")
-            
+            # Tabela de nós ativos (layout limpo)
+            print("\nNÓS ATIVOS:")
+            print(f"{'ID':<10} {'Estado':<7} {'Última Conexão':<16} {'Tempo':<8} {'Vizinhos Ativos':<40}")
             for node_id in sorted(node_state.keys()):
                 info = node_state[node_id]
                 last_seen_seconds = now - info['last_seen']
-                
-                # Determinar estado
-                if last_seen_seconds < 10:
-                    status = "ALIVE"
-                elif last_seen_seconds < 30:
-                    status = "LOST"
-                else:
-                    status = "DEAD"
-                
-                # Formatar última conexão
+                status = "ALIVE" if last_seen_seconds < 10 else ("LOST" if last_seen_seconds < 30 else "DEAD")
                 last_conn = datetime.fromtimestamp(info['last_seen']).strftime('%H:%M:%S')
-                
-                # Tempo decorrido formatado
-                if last_seen_seconds < 60:
-                    time_elapsed = f"{int(last_seen_seconds)}s"
-                elif last_seen_seconds < 3600:
-                    time_elapsed = f"{int(last_seen_seconds/60)}m {int(last_seen_seconds%60)}s"
-                else:
-                    time_elapsed = f"{int(last_seen_seconds/3600)}h {int((last_seen_seconds%3600)/60)}m"
-                
-                # Vizinhos ativos (mostrar IPs)
+                time_elapsed = f"{int(last_seen_seconds)}s" if last_seen_seconds < 60 else f"{int(last_seen_seconds/60)}m"
                 neighbors = info.get('neighbors', {})
-                active_neighbors = [ip for ip, ninfo in neighbors.items() if ninfo.get('metric', 0) > 0]
-                neighbors_str = ', '.join(active_neighbors[:2])  # Mostrar até 2
-                if len(active_neighbors) > 2:
-                    neighbors_str += f" +{len(active_neighbors)-2}"
-                if not neighbors_str:
-                    neighbors_str = "-"
-                
-                print(f"│ {node_id:<12} │ {status:<7} │ {last_conn:<16} │ {time_elapsed:<17} │ {neighbors_str:<40} │")
+                # Mostrar todos vizinhos recebidos
+                neighbors_str = ', '.join(sorted(neighbors.keys())) if neighbors else "-"
+                print(f"{node_id:<10} {status:<7} {last_conn:<16} {time_elapsed:<8} {neighbors_str:<40}")
             
-            print("└" + "─" * 119 + "┘")
-            
-            # Tabela de rotas com custos de ligações
-            print("\n┌─── TABELA DE ROTAS (Seleção Menor Custo) " + "─" * 72 + "┐")
-            
+            # Tabela de rotas (layout limpo)
+            print("\nTABELA DE ROTAS:")
+            print(f"{'Nó':<10} {'Destino':<12} {'Próx. Salto':<16} {'Custo':<8} {'Downstream':<10}")
             for node_id in sorted(node_state.keys()):
                 routing_table = node_state[node_id].get('routing_table', {})
-                neighbors = node_state[node_id].get('neighbors', {})
-                
-                if routing_table or neighbors:
-                    print(f"│ Nó: {node_id:<110} │")
-                    
-                    # Mostrar ligações diretas (vizinhos) com custo
-                    if neighbors:
-                        print(f"│   Ligações Diretas:{'':<95} │")
-                        for neighbor_ip, ninfo in sorted(neighbors.items(), key=lambda x: x[1].get('metric', 0)):
-                            metric = ninfo.get('metric', 0)
-                            print(f"│     → {neighbor_ip:<20} custo: {metric:>6.1f}ms{'':<68} │")
-                    
-                    # Mostrar rotas calculadas (menor custo escolhido)
-                    if routing_table:
-                        print(f"│   Rotas Calculadas (menor custo):{'':<81} │")
-                        for dest_id, route_info in sorted(routing_table.items()):
-                            next_hop = route_info.get('next_hop', 'N/A')
-                            cost = route_info.get('cost', 0)
-                            downstream_count = len(route_info.get('downstream', []))
-                            
-                            # Indicador se serve clientes
-                            serving = f" [servindo {downstream_count}]" if downstream_count > 0 else ""
-                            
-                            if next_hop == "SELF":
-                                print(f"│     ✓ {dest_id:<15} → LOCAL (origem){'':<68} │")
-                            else:
-                                print(f"│     ✓ {dest_id:<15} → via {next_hop:<16} custo: {cost:>6.1f}ms{serving:<35} │")
-                    
-                    print("│" + " " * 119 + "│")
-            
-            print("└" + "─" * 119 + "┘")
+                for dest_id, route_info in sorted(routing_table.items()):
+                    next_hop = route_info.get('next_hop', 'N/A')
+                    cost = route_info.get('cost', 0)
+                    downstream_count = len(route_info.get('downstream', []))
+                    print(f"{node_id:<10} {dest_id:<12} {next_hop:<16} {cost:>6.1f}ms {downstream_count:<10}")
             
             # Streams ativos
             print("\n┌─── STREAMS ATIVOS " + "─" * 98 + "┐")

@@ -150,15 +150,26 @@ def main():
     sock.setblocking(0)
 
     # --- INICIALIZAÇÃO DOS COMPONENTES ---
+    # --- INICIALIZAÇÃO DOS COMPONENTES ---
     ffmpeg_source = None
     ffplay_sink = None
 
+    # Lógica de Seleção de Vídeo
+    current_video_file = None
+    
+    if args.node_id == "STREAMER1":
+        current_video_file = "trailer_the_boys.mp4"
+    elif args.node_id == "STREAMER2":
+        current_video_file = "gta_vi_trailer.mp4"
+
+    # Se for um STREAMER (qualquer um deles), prepara a fonte
     if "STREAMER" in args.node_id:
-        if os.path.exists(VIDEO_SOURCE):
-            # Inicia em Alta Qualidade por defeito
-            ffmpeg_source = FFmpegStreamer(VIDEO_SOURCE, quality='HIGH')
+        if current_video_file and os.path.exists(current_video_file):
+            # Inicia o streamer com o ficheiro correto para este nó
+            ffmpeg_source = FFmpegStreamer(current_video_file, quality='HIGH')
         else:
-            print(f"[ERRO] Vídeo '{VIDEO_SOURCE}' não encontrado!")
+            print(f"[ERRO CRÍTICO] Sou o {args.node_id} mas não encontro o vídeo: {current_video_file}")
+            # Não faz exit, mas avisa que vai ficar parado
 
     if "C" in args.node_id:
         ffplay_sink = FFplayPlayer()
@@ -177,8 +188,8 @@ def main():
     inputs = [sock, sys.stdin]
     frame_seq = 0
     stats_frames_received = 0
-    stats_frames_lost = 0  # <--- FALTAVA ISTO NO TEU SNIPPET
-
+    stats_frames_lost = 0  
+    last_seq_received = -1
     print("[*] Sistema pronto. Comandos: 'join <STREAM_ID>', 'leave <STREAM_ID>', 'status'.")
     
     try:
@@ -350,7 +361,7 @@ def main():
                                     info = json.loads(payload.decode('utf-8'))
                                     loss = info.get('loss_rate', 0.0)
                                     
-                                    if loss > 10.0 and ffmpeg_source.current_quality == 'HIGH':
+                                    if loss > 12.0 and ffmpeg_source.current_quality == 'HIGH':
                                         print(f"\n[⚠️] CONGESTIONAMENTO (Perda: {loss:.1f}%) -> LOW PROFILE")
                                         ffmpeg_source.close()
                                         ffmpeg_source = FFmpegStreamer(VIDEO_SOURCE, quality='LOW')
@@ -366,25 +377,41 @@ def main():
                             try:
                                 info = json.loads(payload.decode('utf-8'))
                                 s_id = info.get('id')
+                                seq = info.get('seq') # Pega o número de sequência
                                 
-                                # Router: Forwarding
+                                # 1. Router: Forwarding
                                 if s_id in node.routing_table:
                                     for child in node.routing_table[s_id].downstream_ips:
                                         if child != sender_ip_real:
                                             pkt = node.pack_message(MsgType.STREAM_DATA, child, payload)
                                             sock.sendto(pkt, (child, DEFAULT_PORT))
                                 
-                                # Cliente: Play
+                                # 2. Cliente: Play & Stats
                                 if ffplay_sink:
+                                    # --- LÓGICA DE DETEÇÃO DE PERDA (NOVO) ---
+                                    if last_seq_received != -1:
+                                        # Se recebi o 10 e agora veio o 15, perdi 4 pacotes (11,12,13,14)
+                                        diff = seq - last_seq_received
+                                        if diff > 1:
+                                            # Proteção para não contar negativos se os pacotes vierem trocados (jitter)
+                                            # ou se o stream reiniciar (reset do seq)
+                                            if diff < 1000: 
+                                                stats_frames_lost += (diff - 1)
+                                            else:
+                                                # Assumimos que foi um reset do stream
+                                                pass
+                                    last_seq_received = seq
+                                    # -----------------------------------------
+
                                     b64_data = info.get('data')
                                     raw_data = base64.b64decode(b64_data)
                                     ffplay_sink.write_data(raw_data)
                                     stats_frames_received += 1
+                                    
                                     if stats_frames_received % 100 == 0:
-                                        print(f"\r[FF] Packets RX: {stats_frames_received}", end="")
+                                        print(f"\r[FF] Packets RX: {stats_frames_received} | Lost: {stats_frames_lost}", end="")
 
                             except Exception as e: pass
-                        
                         if packet_count > 100: break
 
                 elif s is sys.stdin:

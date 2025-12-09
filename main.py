@@ -170,7 +170,6 @@ def main():
         else:
             print(f"[ERRO CRÍTICO] Sou o {args.node_id} mas não encontro o vídeo: {current_video_file}")
             # Não faz exit, mas avisa que vai ficar parado
-
     if "C" in args.node_id:
         ffplay_sink = FFplayPlayer()
 

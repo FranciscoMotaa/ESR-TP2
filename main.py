@@ -14,6 +14,7 @@ from overlay_structs import OverlayNode, MsgType, MAX_PACKET_SIZE
 
 DEFAULT_PORT = 50000
 BOOTSTRAP_PORT = 6000
+MONITOR_PORT = 6001  # Porta UDP do tracker para monitorização
 VIDEO_SOURCE = "trailer_the_boys.mp4" 
 
 # --- CONFIGURAÇÃO REDE ---
@@ -107,21 +108,29 @@ def get_neighbors_dynamic(tracker_ip, my_id, my_ip):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3.0) 
+        print(f"[*] Tentando conectar ao tracker {tracker_ip}:{BOOTSTRAP_PORT} para registar {my_id} ({my_ip})")
         sock.connect((tracker_ip, BOOTSTRAP_PORT))
         request = json.dumps({"id": my_id, "ip": my_ip})
         sock.send(request.encode('utf-8'))
         data = sock.recv(4096)
-        response = json.loads(data.decode('utf-8'))
+        try:
+            raw = data.decode('utf-8')
+        except:
+            raw = str(data)
+        print(f"[*] Resposta bruta do tracker: {raw}")
+        response = json.loads(raw)
         sock.close()
-        
+
         if response.get("status") == "OK":
             neighbors = response.get("neighbors", [])
             print(f"[*] Tracker: Vizinhos atribuídos -> {neighbors}")
             return neighbors
+        print("[WARN] Tracker retornou status != OK")
         return []
     except Exception as e:
-        print(f"[ERRO] Tracker offline: {e}")
-        sys.exit(1)
+        print(f"[ERRO] Falha ao contactar tracker {tracker_ip}:{BOOTSTRAP_PORT}: {e}")
+        # Não terminar o processo; devolver lista vazia para permitir funcionamento offline
+        return []
 
 def main():
     parser = argparse.ArgumentParser()
@@ -179,10 +188,12 @@ def main():
     last_hello = 0
     last_flood = 0
     last_report = 0        # <--- FALTAVA ISTO NO TEU SNIPPET
+    last_monitor_update = 0  # Para enviar updates ao tracker
     
     HELLO_INTERVAL = 1.0 
     FLOOD_INTERVAL = 10.0 
     JOIN_TIMEOUT = 5.0
+    MONITOR_UPDATE_INTERVAL = 2.0  # Enviar estado ao tracker a cada 2s
 
     inputs = [sock, sys.stdin]
     frame_seq = 0
@@ -228,6 +239,40 @@ def main():
                     pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload)
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
                 last_flood = now
+
+            # --- 3.5. Enviar update de estado ao tracker ---
+            if now - last_monitor_update >= MONITOR_UPDATE_INTERVAL:
+                try:
+                    # Preparar dados de estado
+                    routing_table_data = {}
+                    for stream_id, route_entry in node.routing_table.items():
+                        routing_table_data[stream_id] = {
+                            'next_hop': route_entry.proximo_salto_ip,
+                            'cost': route_entry.custo_acumulado,
+                            'downstream': list(route_entry.downstream_ips)
+                        }
+                    
+                    neighbors_data = {}
+                    for n_ip, n_info in node.neighbors.items():
+                        neighbors_data[n_ip] = {
+                            'metric': n_info.get('metric', 0),
+                            'last_seen': n_info.get('last_seen', 0)
+                        }
+                    
+                    # Streams ativos (ou participando)
+                    active_streams = list(node.routing_table.keys())
+                    
+                    state_update = json.dumps({
+                        'node_id': args.node_id,
+                        'neighbors': neighbors_data,
+                        'routing_table': routing_table_data,
+                        'streams': active_streams
+                    }).encode('utf-8')
+                    
+                    sock.sendto(state_update, (args.tracker, MONITOR_PORT))
+                    last_monitor_update = now
+                except Exception as e:
+                    pass  # Silenciosamente ignorar erros de monitorização
 
             # --- 4. Envio de Relatórios QoS (CLIENTE) ---
             if "C" in args.node_id and now - last_report >= 2.0:
@@ -291,6 +336,27 @@ def main():
                         except Exception: break
                         
                         sender_ip_real = addr[0]
+                        
+                        # Verificar se é uma notificação do bootstrapper (JSON puro, sem header overlay)
+                        try:
+                            notification = json.loads(data.decode('utf-8'))
+                            if notification.get('type') == 'neighbor_update':
+                                new_neighbor_ip = notification.get('new_neighbor')
+                                new_neighbor_id = notification.get('neighbor_id')
+                                if new_neighbor_ip and new_neighbor_ip not in node.neighbors:
+                                    # Adicionar novo vizinho dinamicamente
+                                    node.neighbors[new_neighbor_ip] = {
+                                        'metric': 50.0,  # Métrica inicial
+                                        'last_seen': time.time()
+                                    }
+                                    print(f"\n NOVO VIZINHO: {new_neighbor_id} ({new_neighbor_ip}) adicionado dinamicamente!")
+                                    
+                                    # Enviar HELLO imediatamente para estabelecer conexão
+                                    pkt = node.pack_message(MsgType.HELLO, new_neighbor_ip, b"")
+                                    sock.sendto(pkt, (new_neighbor_ip, DEFAULT_PORT))
+                                continue
+                        except: pass
+                        
                         header, payload = node.unpack_message(data)
                         if not header: continue
 
@@ -366,7 +432,7 @@ def main():
                                         ffmpeg_source = FFmpegStreamer(VIDEO_SOURCE, quality='LOW')
                                     
                                     elif loss < 2.0 and ffmpeg_source.current_quality == 'LOW':
-                                        print(f"\n[🚀] REDE RECUPERADA (Perda: {loss:.1f}%) -> HIGH PROFILE")
+                                        print(f"\nREDE RECUPERADA (Perda: {loss:.1f}%) -> HIGH PROFILE")
                                         ffmpeg_source.close()
                                         ffmpeg_source = FFmpegStreamer(VIDEO_SOURCE, quality='HIGH')
                                 except Exception as e: print(f"Erro ABR: {e}")

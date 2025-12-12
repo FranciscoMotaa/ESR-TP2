@@ -303,6 +303,31 @@ def display_monitor():
 				print(f"│ {'Nenhum stream ativo':<117} │")
 
 			print("└" + "─" * 119 + "┘")
+
+			# Mostra mudanças de rotas recentes (últimas 10 globalmente)
+			print("\nMUDANÇAS DE ROTAS RECENTES:")
+			changes = []
+			for n_id, dests in route_history.items():
+				for dest_id, entries in dests.items():
+					for entry in entries:
+						try:
+							ts, next_hop, cost = entry
+						except Exception:
+							continue
+						changes.append((ts, n_id, dest_id, next_hop, cost))
+
+			if changes:
+				# Ordena por timestamp descendente e mostra até 10
+				changes.sort(key=lambda x: x[0], reverse=True)
+				for ts, n_id, dest_id, next_hop, cost in changes[:10]:
+					try:
+						ts_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+					except Exception:
+						ts_str = str(ts)
+					print(f"{ts_str} | {n_id} -> {dest_id}: next_hop={next_hop} cost={float(cost):.1f}ms")
+			else:
+				print("Nenhuma mudança de rotas registada.")
+
 			print("\n[Pressione Ctrl+C para parar o tracker]")
 
 

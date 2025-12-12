@@ -20,6 +20,27 @@ neighbor_discovery = {}
 state_lock = threading.Lock()
 
 
+def format_last_seen(ts, now_ts):
+	"""Retorna uma string legível para o timestamp `ts` comparado com `now_ts`.
+	Exemplos: "17:55:23 (5s ago)", "17:55:23 (3m ago)", "17:55:23 (2h ago)", "2025-12-12".
+	"""
+	if not ts:
+		return "N/A"
+	delta = int(now_ts - ts)
+	dt = datetime.fromtimestamp(ts)
+	if delta < 1:
+		rel = "just now"
+	elif delta < 60:
+		rel = f"{delta}s ago"
+	elif delta < 3600:
+		rel = f"{delta//60}m ago"
+	elif delta < 86400:
+		rel = f"{delta//3600}h ago"
+	else:
+		rel = dt.strftime('%Y-%m-%d')
+	return f"{dt.strftime('%H:%M:%S')} ({rel})"
+
+
 def load_topology():
 	"""Inicializa o Tracker em modo dinâmico."""
 	# Nenhuma topologia estática é carregada.
@@ -228,10 +249,11 @@ def display_monitor():
 			print(f"{'ID':<10} {'Estado':<7} {'Última Conexão':<16} {'Tempo':<8} {'Vizinhos Ativos':<40}")
 			for node_id in sorted(node_state.keys()):
 				info = node_state[node_id]
-				last_seen_seconds = now - info.get("last_seen", 0)
-				status = "ALIVE" if last_seen_seconds < 10 else ("LOST" if last_seen_seconds < 30 else "DEAD")
-				last_conn = datetime.fromtimestamp(info.get("last_seen", 0)).strftime('%H:%M:%S') if info.get("last_seen") else "N/A"
-				time_elapsed = f"{int(last_seen_seconds)}s" if last_seen_seconds < 60 else f"{int(last_seen_seconds/60)}m"
+				last_seen = info.get("last_seen")
+				last_seen_seconds = now - last_seen if last_seen else None
+				status = "ALIVE" if (last_seen_seconds is not None and last_seen_seconds < 10) else ("LOST" if (last_seen_seconds is not None and last_seen_seconds < 30) else "DEAD")
+				last_conn = format_last_seen(last_seen, now)
+				time_elapsed = last_conn
 				neighbors = info.get('neighbors', {})
 
 				active_neighbors = []

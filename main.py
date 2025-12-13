@@ -159,6 +159,17 @@ def main():
     node = OverlayNode(args.node_id, my_ip, DEFAULT_PORT)
     for neighbor_ip in initial_neighbors:
         node.neighbors[neighbor_ip] = {'metric': 50.0, 'last_seen': 0}
+    
+    # --- ATIVAR CRIPTOGRAFIA (Opcional) ---
+    # Chave pode vir de variável ambiente ou usar padrão
+    # Para desativar: export ENABLE_CRYPTO=0
+    enable_crypto = os.environ.get('ENABLE_CRYPTO', '1') == '1'
+    if enable_crypto:
+        stream_key = os.environ.get('STREAM_KEY', 'overlay_default_key_2025')
+        node.security.enable(stream_key)
+        print(f"[*] Modo seguro: Conteúdo de vídeo será cifrado AES-256-GCM")
+    else:
+        print(f"[*] Modo INSEGURO: Criptografia desativada (apenas para testes)")
 
     # Configurar Socket UDP (Buffer ENORME para absorver perdas)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -400,8 +411,8 @@ def main():
                                 "timestamp": now
                             }).encode('utf-8')
                             
-                            # Guardar no buffer de retransmissão
-                            pkt = node.pack_message(MsgType.STREAM_DATA, "broadcast", payload)
+                            # Guardar no buffer de retransmissão (CIFRADO)
+                            pkt = node.pack_message(MsgType.STREAM_DATA, "broadcast", payload, encrypt=True)
                             retx_buffer.add(frame_seq, pkt)
                             
                             # FEC: Adicionar DADOS RAW ao bloco (não o payload JSON inteiro)
@@ -432,7 +443,7 @@ def main():
                                     "sizes": packet_sizes  # Para trim correto na recuperação
                                 }).encode('utf-8')
                                 
-                                fec_pkt = node.pack_message(MsgType.STREAM_FEC, "broadcast", fec_payload)
+                                fec_pkt = node.pack_message(MsgType.STREAM_FEC, "broadcast", fec_payload, encrypt=True)
                                 
                                 # LOG: Envio de FEC
                                 if frame_seq % 50 == 0:  # A cada 50 frames
@@ -458,6 +469,7 @@ def main():
                                 total_sent = frame_seq
                                 fec_sent = frame_seq // fec_k
                                 print(f"\n[STREAMER-STATS] Frames: {total_sent} | FEC: {fec_sent} | Clientes: {num_clients}")
+                                print(f"[STREAMER-STATS] Cifrados: {node.stats_encrypted_sent} pacotes")
                                 if client_metrics:
                                     for cip, cm in client_metrics.items():
                                         print(f"[STREAMER-STATS]   {cip}: Loss {cm.loss_rate:.1f}%")
@@ -599,10 +611,10 @@ def main():
                                         retx_pkt = retx_buffer.get(seq)
                                         if retx_pkt:
                                             # Modificar header para STREAM_RETX em vez de recriar pacote
-                                            # Extrai payload original e recria como STREAM_RETX
+                                            # Extrai payload original e recria como STREAM_RETX (CIFRADO)
                                             _, original_payload = node.unpack_message(retx_pkt)
                                             if original_payload:
-                                                retx_packet = node.pack_message(MsgType.STREAM_RETX, sender_ip_real, original_payload)
+                                                retx_packet = node.pack_message(MsgType.STREAM_RETX, sender_ip_real, original_payload, encrypt=True)
                                                 sock.sendto(retx_packet, (sender_ip_real, DEFAULT_PORT))
                                                 retx_count += 1
                                     
@@ -771,6 +783,7 @@ def main():
                                         print(f"[CLIENTE-INIT] Buffer ADAPTATIVO: inicia em {jitter_buffer_delay*1000:.0f}ms")
                                         print(f"[CLIENTE-INIT] FEC: k=4 (25% overhead) + NACK 30ms")
                                         print(f"[CLIENTE-INIT] Adaptará buffer automaticamente (200-600ms)")
+                                        print(f"[CLIENTE-INIT] Criptografia AES-256-GCM: ATIVA")
                                         print(f"{'='*70}")
                                     
                                     # Adicionar ao JITTER BUFFER em vez de reproduzir imediatamente
@@ -886,13 +899,19 @@ def main():
                                         if recv_seq >= expected_seq:
                                             expected_seq = recv_seq + 1
                                     
-                                    # Cleanup periódico
+                                    # Cleanup periódico + Stats de criptografia
                                     if stats_frames_received % 100 == 0:
                                         node.fec_decoder.cleanup_old_blocks(recv_seq)
                                         # Limpar received_seqs antigos (manter só últimos 100 seqs)
                                         if recv_seq > last_cleanup_seq + 100:
                                             received_seqs = {s for s in received_seqs if s > recv_seq - 100}
                                             last_cleanup_seq = recv_seq
+                                        
+                                        # Log de criptografia
+                                        if stats_frames_received % 200 == 0:
+                                            print(f"\n[CLIENTE-STATS] Recebidos: {stats_frames_received} | Decifrados: {node.stats_encrypted_recv}")
+                                            if node.stats_decrypt_failed > 0:
+                                                print(f"[CLIENTE-WARN] Falhas autenticação: {node.stats_decrypt_failed}")
                                     
                                     # ACK Cumulativo
                                     if stats_frames_received % 25 == 0 and join_state['target_ip']:

@@ -1,14 +1,21 @@
 import struct
 import json
 import time
+import os
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import List, Dict, Set, Optional
+from typing import List, Dict, Set, Optional, Tuple
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
 
 # --- CONSTANTES ---
 MAX_PACKET_SIZE = 4096 
-HEADER_FORMAT = "!B 16s 16s I d" # Type, SrcIP, DstIP, Seq, Timestamp
+HEADER_FORMAT = "!B 16s 16s I d B" # Type, SrcIP, DstIP, Seq, Timestamp, Encrypted
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+IV_SIZE = 12  # GCM nonce size
+TAG_SIZE = 16  # GCM authentication tag size
 
 class MsgType(Enum):
     HELLO = 1            
@@ -270,6 +277,103 @@ class FECDecoder:
         for seq in old_recovered:
             del self.recovered_packets[seq]
 
+# --- SISTEMA DE CRIPTOGRAFIA ---
+class SecurityManager:
+    """
+    Gestor de Segurança: AES-256-GCM
+    
+    - AES-256: Cifra simétrica (256-bit key)
+    - GCM: Galois/Counter Mode (autenticação + confidencialidade)
+    - Overhead: 28 bytes (12B IV + 16B tag)
+    - Performance: ~500 MB/s com AES-NI
+    """
+    
+    def __init__(self):
+        self.enabled = False
+        self.aesgcm = None
+        self.key = None
+    
+    def enable(self, passphrase: str, salt: bytes = b'overlay_stream_2025'):
+        """
+        Ativa criptografia com derivação de chave PBKDF2.
+        
+        Args:
+            passphrase: Senha/chave mestra
+            salt: Salt para PBKDF2 (deve ser único por aplicação)
+        """
+        # Derivar chave de 256-bit da passphrase
+        # Reduzido para 10k iterações (trade-off: startup rápido vs força brute-force)
+        # 10k ainda é seguro (NIST mínimo: 1k, recomendado: 10k+)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,  # 256 bits
+            salt=salt,
+            iterations=10000,  # Otimizado para baixa latência
+            backend=default_backend()
+        )
+        self.key = kdf.derive(passphrase.encode('utf-8'))
+        self.aesgcm = AESGCM(self.key)
+        self.enabled = True
+        print(f"[SECURITY] Criptografia AES-256-GCM ativada ✓")
+    
+    def is_enabled(self) -> bool:
+        """Verifica se criptografia está ativa"""
+        return self.enabled
+    
+    def encrypt(self, plaintext: bytes) -> Tuple[bytes, bytes, bytes]:
+        """
+        Cifra dados com AES-256-GCM.
+        
+        Args:
+            plaintext: Dados em claro
+        
+        Returns:
+            (iv, ciphertext, tag): IV (12B), texto cifrado, tag autenticação (16B)
+        """
+        if not self.enabled:
+            raise RuntimeError("Criptografia não está ativada")
+        
+        # Gerar nonce aleatório (DEVE ser único por mensagem)
+        iv = os.urandom(12)
+        
+        # AES-GCM: cifra + autentica em uma operação
+        # Retorna: ciphertext || tag (últimos 16 bytes)
+        ciphertext_with_tag = self.aesgcm.encrypt(iv, plaintext, None)
+        
+        # Separar ciphertext e tag
+        ciphertext = ciphertext_with_tag[:-16]
+        tag = ciphertext_with_tag[-16:]
+        
+        return iv, ciphertext, tag
+    
+    def decrypt(self, iv: bytes, ciphertext: bytes, tag: bytes) -> Optional[bytes]:
+        """
+        Decifra dados com AES-256-GCM.
+        
+        Args:
+            iv: Nonce (12 bytes)
+            ciphertext: Dados cifrados
+            tag: Tag de autenticação (16 bytes)
+        
+        Returns:
+            Dados em claro ou None se falhar autenticação
+        """
+        if not self.enabled:
+            raise RuntimeError("Criptografia não está ativada")
+        
+        try:
+            # Reconstruir formato esperado: ciphertext || tag
+            ciphertext_with_tag = ciphertext + tag
+            
+            # Decifrar e verificar autenticação
+            plaintext = self.aesgcm.decrypt(iv, ciphertext_with_tag, None)
+            return plaintext
+        
+        except Exception as e:
+            # Falha na autenticação ou dados corrompidos
+            print(f"[SECURITY] Falha ao decifrar: {e}")
+            return None
+
 class OverlayNode:
     def __init__(self, node_id, ip, port):
         self.node_id = node_id
@@ -281,26 +385,93 @@ class OverlayNode:
         self.lsa_database: Dict[tuple, float] = {}
         self.pending_pings: Dict[int, float] = {}
         self.fec_decoder = FECDecoder(k=1)  # k=1 (100% overhead) máxima robustez
+        self.security = SecurityManager()  # Gestor de segurança
+        
+        # Estatísticas de segurança
+        self.stats_encrypted_sent = 0
+        self.stats_encrypted_recv = 0
+        self.stats_decrypt_failed = 0
 
-    def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"") -> bytes:
+    def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"", encrypt: bool = False) -> bytes:
+        """
+        Cria pacote com header + payload (opcionalmente cifrado).
+        
+        Args:
+            msg_type: Tipo de mensagem
+            dest_ip: IP destino
+            payload: Dados
+            encrypt: Se True, cifra payload com AES-GCM
+        
+        Returns:
+            Pacote completo (header sempre claro, payload pode ser cifrado)
+        """
         self.sequence_number += 1
         timestamp = time.time()
         src_ip_bytes = self.ip.encode('utf-8').ljust(16, b'\0')
         dest_ip_bytes = dest_ip.encode('utf-8').ljust(16, b'\0')
-        header = struct.pack(HEADER_FORMAT, msg_type.value, src_ip_bytes, dest_ip_bytes, self.sequence_number, timestamp)
+        
+        # Cifrar payload se solicitado E segurança ativa
+        is_encrypted = 0  # Flag: 0 = claro, 1 = cifrado
+        if encrypt and self.security.is_enabled():
+            iv, ciphertext, tag = self.security.encrypt(payload)
+            payload = iv + ciphertext + tag
+            is_encrypted = 1
+            self.stats_encrypted_sent += 1
+        
+        # Header SEMPRE em claro (para roteamento)
+        header = struct.pack(HEADER_FORMAT, msg_type.value, src_ip_bytes, dest_ip_bytes, 
+                           self.sequence_number, timestamp, is_encrypted)
         return header + payload
 
     def unpack_message(self, data: bytes):
+        """
+        Extrai header + payload (decifrando se necessário).
+        
+        Returns:
+            (header_dict, payload) ou (None, None) se inválido
+        """
         if len(data) < HEADER_SIZE: return None, None
         header_bytes = data[:HEADER_SIZE]
         payload = data[HEADER_SIZE:]
-        msg_type_val, src_ip_raw, dst_ip_raw, seq, ts = struct.unpack(HEADER_FORMAT, header_bytes)
+        
+        # Desempacotar header (agora com flag de encriptação)
+        msg_type_val, src_ip_raw, dst_ip_raw, seq, ts, is_encrypted = struct.unpack(HEADER_FORMAT, header_bytes)
+        
+        # Decifrar payload se necessário
+        if is_encrypted == 1 and self.security.is_enabled():
+            # Extrair IV, ciphertext e tag
+            if len(payload) < (IV_SIZE + TAG_SIZE):
+                print(f"[SECURITY] Pacote cifrado muito pequeno (seq={seq})")
+                self.stats_decrypt_failed += 1
+                return None, None
+            
+            iv = payload[:IV_SIZE]
+            ciphertext = payload[IV_SIZE:-TAG_SIZE]
+            tag = payload[-TAG_SIZE:]
+            
+            # Decifrar
+            plaintext = self.security.decrypt(iv, ciphertext, tag)
+            if plaintext is None:
+                src_ip_clean = src_ip_raw.decode('utf-8').strip('\x00')
+                print(f"[SECURITY] Falha autenticação pacote seq={seq} de {src_ip_clean}")
+                self.stats_decrypt_failed += 1
+                return None, None
+            
+            payload = plaintext
+            self.stats_encrypted_recv += 1
+        
+        elif is_encrypted == 1 and not self.security.is_enabled():
+            # Pacote cifrado mas segurança não ativa
+            print(f"[SECURITY] Pacote cifrado recebido mas criptografia não está ativa!")
+            return None, None
+        
         return {
             "type": MsgType(msg_type_val),
             "source_ip": src_ip_raw.decode('utf-8').strip('\0'),
             "dest_ip": dst_ip_raw.decode('utf-8').strip('\0'),
             "seq": seq,
-            "timestamp": ts
+            "timestamp": ts,
+            "encrypted": is_encrypted == 1
         }, payload
 
     # --- LÓGICA DE PROTOCOLO ---

@@ -31,7 +31,7 @@ class FFmpegStreamer:
         if quality == 'HIGH':
             print(f"[STREAMER-INIT] Bitrate: 400kbps | Resolucao: 640x480 | PREMIUM")
         else:
-            print(f"[STREAMER-INIT] Bitrate: 200kbps | Resolucao: 480x360 | OTIMO")
+            print(f"[STREAMER-INIT] Bitrate: 100kbps | Resolucao: 320x240 | OTIMO (anti-perda)")
         print(f"{'='*70}")
         
         # --- PERFIS DE QUALIDADE PREMIUM ---
@@ -40,11 +40,15 @@ class FFmpegStreamer:
             scale = "640:480"
             v_bitrate = "400k"   # Qualidade premium sem pixelização
             a_bitrate = "64k"   # Áudio bom
+            bufsize = "800k"
+            gop = "12"
         else: # LOW
-            # LOW: 480x360, 200k video - Qualidade boa
-            scale = "480:360"
-            v_bitrate = "200k"   # Qualidade nítida
-            a_bitrate = "48k"   # Áudio aceitável
+            # LOW: 320x240, 100k video - Otimizado contra quebras com 10% perdas
+            scale = "320:240"
+            v_bitrate = "100k"   # Bitrate reduzido para evitar artefatos em perdas
+            a_bitrate = "32k"    # Áudio reduzido
+            bufsize = "200k"     # Buffer menor
+            gop = "24"           # GOP maior = menos keyframes = mais robusto
 
         command = [
             'ffmpeg',
@@ -56,10 +60,10 @@ class FFmpegStreamer:
             '-c:v', 'mpeg2video',
             '-b:v', v_bitrate,
             '-maxrate', v_bitrate,  # Limitar picos
-            '-bufsize', '800k',     # Buffer encoder
+            '-bufsize', bufsize,     # Buffer encoder
             '-qmin', '2',           # Qualidade mínima (menos pixelização)
             '-qmax', '10',          # Qualidade máxima
-            '-g', '12',             # GOP 12 frames
+            '-g', gop,             # GOP 12 frames
             '-bf', '2',             # B-frames para compressão eficiente
             '-c:a', 'mp2',
             '-b:a', a_bitrate,
@@ -87,20 +91,21 @@ class FFplayPlayer:
             'ffplay',
             '-f', 'mpegts',
             
-            # --- Tolerância a Falhas COM Qualidade ---
-            '-fflags', '+genpts+igndts',  # Gerar PTS, ignorar DTS incorretos
-            '-err_detect', 'careful',     # Detectar erros mas não descartar tudo
+            # --- Tolerância MÁXIMA a Falhas ---
+            '-fflags', '+genpts+igndts+discardcorrupt',  # Gerar PTS, ignorar DTS, descartar corrompidos
+            '-err_detect', 'ignore_err',     # Ignorar erros e tentar continuar
             
-            # --- Sincronização & Áudio ---
-            '-sync', 'video',           # Vídeo é Mestre
-            '-af', 'aresample=async=1', # Áudio sincronizado
+            # --- Sincronização CORRETA (ext = baseado no tempo real) ---
+            '-sync', 'ext',           # Sincronização externa (tempo real)
+            # NÃO usar setpts - causa dessincronização!
             
-            # --- Performance QUALIDADE ---
+            # --- Buffer MODERADO ---
             '-infbuf',                  # Buffer infinito
+            '-framedrop',               # Dropar frames se necessário
             
-            # --- Análise MAXIMA de Stream ---
-            '-probesize', '8192',       # Análise máxima
-            '-analyzeduration', '2000000', # 2s de análise completa
+            # --- Análise RÁPIDA para startup rápido ---
+            '-probesize', '32000',      # Análise mínima (startup rápido)
+            '-analyzeduration', '500000', # 0.5s análise (foi 2s)
             
             '-window_title', 'Streamer 1',
             '-x', '640', '-y', '480',
@@ -190,13 +195,13 @@ def main():
     retx_buffer = RetransmissionBuffer()  # Buffer de pacotes enviados
     client_metrics: Dict[str, ClientQoSMetrics] = {}  # Métricas por cliente
     
-    # FEC: k=1 simples + NACK agressivo (100% overhead)
-    # k=1: 1 pacote + 1 FEC = recuperação imediata se FEC chegar
-    # NACK com 50ms cooldown: recupera o que FEC não pegou
-    # Estratégia híbrida: FEC elimina ~80-90%, NACK elimina resto
-    # 100% overhead é ótimo para qualidade perfeita até 10% perda!
+    # FEC: k=3 + NACK agressivo (33% overhead)
+    # k=3: 3 pacotes + 1 FEC = recuperação de 1 perda em cada bloco de 3
+    # NACK com 30ms cooldown: recupera o que FEC não pegou
+    # Estratégia híbrida: FEC elimina ~90%, NACK elimina resto
+    # 33% overhead + buffer grande = qualidade perfeita até 10%+ perda!
     fec_block_buffer = []  # Acumula k pacotes antes de enviar FEC
-    fec_k = 1  # 1 pacote + 1 paridade = 100% overhead (MÁXIMA ROBUSTEZ)
+    fec_k = 3  # 3 pacotes + 1 paridade = 33% overhead (ÓTIMO PARA 10%)
     
     # Cliente: Controle de recepção COM jitter buffer (ESSENCIAL para qualidade)
     expected_seq = None  # Inicializar com primeiro pacote recebido
@@ -207,9 +212,9 @@ def main():
     fec_recovered_count = 0  # Estatística de pacotes recuperados via FEC
     last_cleanup_seq = 0  # Para limpar received_seqs periodicamente
     
-    # JITTER BUFFER: Acumula 600ms antes de reproduzir (CRÍTICO!)
+    # JITTER BUFFER: Acumula 300ms antes de reproduzir (BALANÇO rápido + qualidade)
     jitter_buffer = {}  # {seq: (data, timestamp)}
-    jitter_buffer_delay = 0.6  # 600ms - Elimina quebras até 10% loss
+    jitter_buffer_delay = 0.3  # 300ms - Suficiente para FEC+NACK recuperarem perdas
     playback_started = False
     
     HELLO_INTERVAL = 1.0 
@@ -594,22 +599,22 @@ def main():
                                         avg_loss = sum(m.loss_rate for m in client_metrics.values()) / len(client_metrics)
                                         max_loss = max(m.loss_rate for m in client_metrics.values())
                                         
-                                        # Estratégia: Bitrate MUITO baixo permite HIGH até 8%
-                                        # > 8% perda OU > 6 perdas consecutivas = LOW
-                                        # < 3% perda = HIGH
+                                        # Estratégia: Bitrate baixo permite HIGH até 5%
+                                        # > 5% perda OU > 4 perdas consecutivas = LOW (100kbps)
+                                        # < 2% perda = HIGH (400kbps)
                                         worst_consecutive = max((m.consecutive_losses for m in client_metrics.values()), default=0)
                                         
                                         # LOG: Avaliação ABR (sempre mostrar)
                                         print(f"[STREAMER-ABR] Qualidade atual: {ffmpeg_source.current_quality}")
                                         print(f"[STREAMER-ABR] Max Loss: {max_loss:.1f}% | Avg: {avg_loss:.1f}% | Consecutivas: {worst_consecutive}")
-                                        print(f"[STREAMER-ABR] Limiar HIGH->LOW: 8% | LOW->HIGH: 3%")
+                                        print(f"[STREAMER-ABR] Limiar HIGH->LOW: 5% | LOW->HIGH: 2%")
                                         
-                                        if (max_loss > 8.0 or worst_consecutive >= 6) and ffmpeg_source.current_quality == 'HIGH':
+                                        if (max_loss > 5.0 or worst_consecutive >= 4) and ffmpeg_source.current_quality == 'HIGH':
                                             print(f"\n" + "="*70)
                                             print(f"[ABR-MUDANCA] HIGH -> LOW")
-                                            print(f"[ABR-MUDANCA] Motivo: Perda {max_loss:.1f}% (limiar: 8%)")
-                                            print(f"[ABR-MUDANCA] Bitrate: 400kbps -> 200kbps")
-                                            print(f"[ABR-MUDANCA] Resolucao: 640x480 -> 480x360")
+                                            print(f"[ABR-MUDANCA] Motivo: Perda {max_loss:.1f}% (limiar: 5%)")
+                                            print(f"[ABR-MUDANCA] Bitrate: 400kbps -> 100kbps")
+                                            print(f"[ABR-MUDANCA] Resolucao: 640x480 -> 320x240")
                                             print(f"[ABR-MUDANCA] Consecutivas: {worst_consecutive} | Media: {avg_loss:.1f}%")
                                             print("="*70)
                                             ffmpeg_source.close()
@@ -618,12 +623,12 @@ def main():
                                                 m.consecutive_losses = 0
                                                 m.current_quality = 'LOW'
                                         
-                                        elif max_loss < 3.0 and worst_consecutive == 0 and ffmpeg_source.current_quality == 'LOW':
+                                        elif max_loss < 2.0 and worst_consecutive == 0 and ffmpeg_source.current_quality == 'LOW':
                                             print(f"\n" + "="*70)
                                             print(f"[ABR-MUDANCA] LOW -> HIGH")
-                                            print(f"[ABR-MUDANCA] Motivo: Rede estavel ({max_loss:.1f}% < 3%)")
-                                            print(f"[ABR-MUDANCA] Bitrate: 200kbps -> 400kbps")
-                                            print(f"[ABR-MUDANCA] Resolucao: 480x360 -> 640x480")
+                                            print(f"[ABR-MUDANCA] Motivo: Rede estavel ({max_loss:.1f}% < 2%)")
+                                            print(f"[ABR-MUDANCA] Bitrate: 100kbps -> 400kbps")
+                                            print(f"[ABR-MUDANCA] Resolucao: 320x240 -> 640x480")
                                             print(f"[ABR-MUDANCA] Media: {avg_loss:.1f}%")
                                             print("="*70)
                                             ffmpeg_source.close()
@@ -707,8 +712,8 @@ def main():
                                         playback_started = False  # Aguardar buffer
                                         print(f"\n{'='*70}")
                                         print(f"[CLIENTE-INIT] Primeiro pacote recebido: seq={recv_seq}")
-                                        print(f"[CLIENTE-INIT] Jitter buffer: 600ms (30 pacotes)")
-                                        print(f"[CLIENTE-INIT] FEC: k=1 (100% overhead) + NACK 30ms")
+                                        print(f"[CLIENTE-INIT] Jitter buffer: 300ms (15 pacotes)")
+                                        print(f"[CLIENTE-INIT] FEC: k=3 (33% overhead) + NACK 50ms")
                                         print(f"{'='*70}")
                                     
                                     # Adicionar ao JITTER BUFFER em vez de reproduzir imediatamente
@@ -728,7 +733,7 @@ def main():
                                         # CONTAR PERDA REAL DA REDE (ANTES de qualquer recuperação)
                                         stats_network_lost += gap_size  # <-- PERDA REAL
                                         
-                                        # ESTRATÉGIA: FEC IMEDIATO (sem jitter)
+                                        # ESTRATÉGIA: FEC adiciona ao JITTER BUFFER (mantém sincronia AV)
                                         recovered_count = 0
                                         fec_failed_count = 0
                                         for missing_seq in range(expected_seq, recv_seq):
@@ -737,7 +742,7 @@ def main():
                                                 recovered_count += 1
                                                 continue
                                                 
-                                            # Tentar recuperar via FEC IMEDIATAMENTE
+                                            # Tentar recuperar via FEC
                                             fec_data = node.fec_decoder.get_recovered(missing_seq)
                                             if fec_data:
                                                 try:
@@ -745,11 +750,12 @@ def main():
                                                     if (len(fec_data) > 0 and 
                                                         len(fec_data) <= CHUNK_SIZE * 2 and
                                                         len(fec_data) >= 20):  # Mínimo flexível
-                                                        # Reproduzir imediatamente
-                                                        ffplay_sink.write_data(fec_data)
+                                                        # ADICIONAR AO JITTER BUFFER em vez de reproduzir direto
+                                                        # Usar timestamp estimado baseado no gap
+                                                        estimated_ts = packet_timestamp - (recv_seq - missing_seq) * 0.02
+                                                        jitter_buffer[missing_seq] = (fec_data, estimated_ts)
                                                         fec_recovered_count += 1
                                                         recovered_count += 1
-                                                        stats_frames_received += 1
                                                         received_seqs.add(missing_seq)
                                                     else:
                                                         fec_failed_count += 1
@@ -769,7 +775,7 @@ def main():
                                             print(f"[CLIENTE-FEC] Gap {gap_size}: FEC OK={recovered_count} | FEC FAIL={fec_failed_count} | Perdido={actual_lost}")
                                         
                                         # NACK ULTRA AGRESSIVO: Recuperar rapidamente o que FEC não pegou
-                                        if actual_lost > 0 and now - last_nack_time > 0.03:  # 30ms cooldown
+                                        if actual_lost > 0 and now - last_nack_time > 0.05:  # 50ms cooldown
                                             missing_seqs = []
                                             for seq in range(expected_seq, recv_seq):
                                                 # Verificar se realmente está perdido (não em received_seqs)
@@ -792,12 +798,12 @@ def main():
                                         # Atualizar expected_seq para depois do gap
                                         expected_seq = recv_seq
                                     
-                                    # REPRODUZIR DO JITTER BUFFER (aguarda 600ms)
-                                    if not playback_started and len(jitter_buffer) >= 30:  # Buffer mínimo maior
+                                    # REPRODUZIR DO JITTER BUFFER (aguarda 300ms)
+                                    if not playback_started and len(jitter_buffer) >= 15:  # Buffer otimizado (15 pacotes = 300ms)
                                         playback_started = True
                                         print(f"\n{'='*70}")
                                         print(f"[CLIENTE-BUFFER] Iniciando playback")
-                                        print(f"[CLIENTE-BUFFER] Buffer acumulado: {len(jitter_buffer)} pacotes (600ms)")
+                                        print(f"[CLIENTE-BUFFER] Buffer acumulado: {len(jitter_buffer)} pacotes (300ms)")
                                         print(f"{'='*70}")
                                     
                                     if playback_started:

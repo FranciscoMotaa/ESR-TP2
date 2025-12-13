@@ -95,11 +95,11 @@ class FFplayPlayer:
             '-fflags', '+genpts+igndts+discardcorrupt',  # Gerar PTS, ignorar DTS, descartar corrompidos
             '-err_detect', 'ignore_err',     # Ignorar erros e tentar continuar
             
-            # --- Sincronização CORRETA (ext = baseado no tempo real) ---
-            '-sync', 'ext',           # Sincronização externa (tempo real)
-            # NÃO usar setpts - causa dessincronização!
+            # --- Sincronização CORRETA (audio = prioridade ao áudio) ---
+            '-sync', 'audio',         # Áudio como mestre (sem quebras)
+            '-autoexit',              # Fechar automaticamente no fim
             
-            # --- Buffer MODERADO ---
+            # --- Buffer GRANDE para suavidade ---
             '-infbuf',                  # Buffer infinito
             '-framedrop',               # Dropar frames se necessário
             
@@ -195,15 +195,16 @@ def main():
     retx_buffer = RetransmissionBuffer()  # Buffer de pacotes enviados
     client_metrics: Dict[str, ClientQoSMetrics] = {}  # Métricas por cliente
     
-    # FEC: k=3 + NACK agressivo (33% overhead)
-    # k=3: 3 pacotes + 1 FEC = recuperação de 1 perda em cada bloco de 3
-    # NACK com 30ms cooldown: recupera o que FEC não pegou
-    # Estratégia híbrida: FEC elimina ~90%, NACK elimina resto
-    # 33% overhead + buffer grande = qualidade perfeita até 10%+ perda!
+    # FEC: k=4 com redundância adaptativa
+    # Sistema ADAPTATIVO: ajusta baseado em perdas reais
+    # 0-2% perdas: sem redundância, buffer 200ms (RÁPIDO)
+    # 2-5% perdas: 1x FEC, buffer 400ms (BALANCEADO)
+    # 5-10% perdas: 2x FEC, buffer 600ms (ROBUSTO)
     fec_block_buffer = []  # Acumula k pacotes antes de enviar FEC
-    fec_k = 3  # 3 pacotes + 1 paridade = 33% overhead (ÓTIMO PARA 10%)
+    fec_k = 4  # 4 pacotes + 1 paridade = 25% overhead
+    fec_redundancy = 1  # Quantas vezes enviar FEC (adaptativo: 1 ou 2)
     
-    # Cliente: Controle de recepção COM jitter buffer (ESSENCIAL para qualidade)
+    # Cliente: Controle de recepção COM jitter buffer ADAPTATIVO
     expected_seq = None  # Inicializar com primeiro pacote recebido
     first_packet_received = False
     last_ack_sent = 0
@@ -212,10 +213,16 @@ def main():
     fec_recovered_count = 0  # Estatística de pacotes recuperados via FEC
     last_cleanup_seq = 0  # Para limpar received_seqs periodicamente
     
-    # JITTER BUFFER: Acumula 300ms antes de reproduzir (BALANÇO rápido + qualidade)
+    # JITTER BUFFER ADAPTATIVO: ajusta baseado em perdas
     jitter_buffer = {}  # {seq: (data, timestamp)}
-    jitter_buffer_delay = 0.3  # 300ms - Suficiente para FEC+NACK recuperarem perdas
+    jitter_buffer_delay = 0.3  # Começa em 300ms (estável com 0% perdas)
+    jitter_buffer_min_packets = 15  # 15 pacotes = 300ms inicial
     playback_started = False
+    
+    # Métricas para adaptação (cliente)
+    recent_loss_rate = 0.0  # Taxa de perda recente
+    loss_history = []  # Histórico de perdas
+    last_adaptation = 0.0  # Última vez que ajustamos parâmetros
     
     HELLO_INTERVAL = 1.0 
     FLOOD_INTERVAL = 10.0 
@@ -228,11 +235,13 @@ def main():
     stats_frames_lost = 0  # Perda FINAL (após FEC+NACK)
     stats_network_lost = 0  # Perda REAL da rede (antes FEC) - NOVO
     
-    # Pacing adaptativo e mais suave
-    base_pacing = 0.003  # 3ms base (era 2ms - mais suave ainda)
+    # Pacing adaptativo: 3ms (estável) inicial, ajusta baseado em feedback
+    base_pacing = 0.003  # 3ms base (333 pkt/s - estável sem quebras)
     current_pacing = base_pacing
     packets_sent_burst = 0
     last_burst_reset = time.time()
+    last_pacing_adjust = 0.0
+    fec_redundancy = 1  # Quantas vezes enviar FEC (1x ou 2x - adaptativo)
 
     print("[*] Sistema pronto. Comandos: 'join <STREAM_ID>', 'leave <STREAM_ID>', 'status'.")
     
@@ -319,6 +328,36 @@ def main():
                     total_final = stats_frames_received + stats_frames_lost
                     final_loss_rate = (stats_frames_lost / total_final * 100.0) if total_final > 0 else 0.0
                     
+                    # ADAPTAÇÃO DINÂMICA DO JITTER BUFFER (baseado em perdas)
+                    loss_history.append(network_loss_rate)
+                    if len(loss_history) > 5:  # Manter últimas 5 medições
+                        loss_history.pop(0)
+                    recent_loss_rate = sum(loss_history) / len(loss_history)
+                    
+                    # Ajustar jitter buffer a cada 2 segundos (resposta mais rápida)
+                    if now - last_adaptation >= 2.0:
+                        old_delay = jitter_buffer_delay
+                        old_packets = jitter_buffer_min_packets
+                        
+                        # Limiares mais conservadores para evitar oscilações
+                        if recent_loss_rate < 0.5:  # <0.5% perdas = MODO RÁPIDO
+                            jitter_buffer_delay = 0.3  # 300ms (não 200ms - mais estável)
+                            jitter_buffer_min_packets = 15
+                        elif recent_loss_rate < 2.0:  # 0.5-2% = MODO BALANCEADO
+                            jitter_buffer_delay = 0.4  # 400ms
+                            jitter_buffer_min_packets = 20
+                        elif recent_loss_rate < 5.0:  # 2-5% = MODO DEFENSIVO
+                            jitter_buffer_delay = 0.5  # 500ms
+                            jitter_buffer_min_packets = 25
+                        else:  # >5% = MODO ROBUSTO
+                            jitter_buffer_delay = 0.65  # 650ms (mais margem)
+                            jitter_buffer_min_packets = 33
+                        
+                        if old_delay != jitter_buffer_delay:
+                            print(f"\n[ADAPTAÇÃO] Perdas: {recent_loss_rate:.1f}% | Buffer: {old_delay*1000:.0f}ms -> {jitter_buffer_delay*1000:.0f}ms")
+                        
+                        last_adaptation = now
+                    
                     # DICA DE TESTE: Para testar a troca de qualidade, podes descomentar:
                     # network_loss_rate = 15.0 
 
@@ -397,12 +436,15 @@ def main():
                                 
                                 # LOG: Envio de FEC
                                 if frame_seq % 50 == 0:  # A cada 50 frames
-                                    print(f"\n[STREAMER-FEC] Block {block_id}: {len(packet_sizes)} pacotes ({packet_sizes}) [ENVIANDO COM NACK]")
+                                    print(f"\n[STREAMER-FEC] Block {block_id}: {len(packet_sizes)} pacotes - Redundância: {fec_redundancy}x")
                                 
-                                # ESTRATÉGIA FINAL: FEC + NACK agressivo
-                                # Enviar 1 FEC imediatamente, NACK fará retransmissões
+                                # ESTRATÉGIA ADAPTATIVA: FEC com redundância baseada em feedback
+                                # fec_redundancy é ajustado pelo relatório dos clientes (1x ou 2x)
                                 for client_ip in clients:
-                                    sock.sendto(fec_pkt, (client_ip, DEFAULT_PORT))
+                                    for _ in range(fec_redundancy):
+                                        sock.sendto(fec_pkt, (client_ip, DEFAULT_PORT))
+                                        if fec_redundancy > 1:
+                                            time.sleep(0.001)  # 1ms entre duplicatas
                                 
                                 # Limpar buffer FEC
                                 fec_block_buffer = fec_block_buffer[fec_k:]
@@ -420,19 +462,33 @@ def main():
                                     for cip, cm in client_metrics.items():
                                         print(f"[STREAMER-STATS]   {cip}: Loss {cm.loss_rate:.1f}%")
                             
-                            # A cada segundo, ajustar pacing baseado em feedback
+                            # ADAPTAÇÃO A CADA 2 SEGUNDOS baseado em feedback dos clientes
                             packets_sent_burst += 1
-                            if now - last_burst_reset > 1.0:
-                                # Se há clientes com muita perda, aumentar pacing
+                            if now - last_pacing_adjust > 2.0:
                                 if client_metrics:
                                     max_loss = max((m.loss_rate for m in client_metrics.values()), default=0)
-                                    if max_loss > 10:
-                                        current_pacing = min(base_pacing * 2, 0.010)  # Máximo 10ms
-                                    elif max_loss < 3:
-                                        current_pacing = base_pacing  # Voltar ao normal
+                                    old_pacing = current_pacing
+                                    old_redundancy = fec_redundancy
+                                    
+                                    # Ajustar pacing e redundância FEC (mais conservador)
+                                    if max_loss < 0.5:  # <0.5% perdas = MODO RÁPIDO
+                                        current_pacing = 0.003  # 3ms (333 pkt/s - estável)
+                                        fec_redundancy = 1  # Sem redundância
+                                    elif max_loss < 3.0:  # 0.5-3% = MODO NORMAL
+                                        current_pacing = 0.003  # 3ms (mantém estável)
+                                        fec_redundancy = 1  # Sem redundância
+                                    elif max_loss < 6.0:  # 3-6% = MODO DEFENSIVO
+                                        current_pacing = 0.004  # 4ms (250 pkt/s)
+                                        fec_redundancy = 2  # 2x redundância
+                                    else:  # >6% = MODO ROBUSTO
+                                        current_pacing = 0.005  # 5ms (200 pkt/s)
+                                        fec_redundancy = 2  # 2x redundância
+                                    
+                                    if old_pacing != current_pacing or old_redundancy != fec_redundancy:
+                                        print(f"\n[STREAMER-ADAPT] Perdas: {max_loss:.1f}% | Pacing: {old_pacing*1000:.0f}ms->{current_pacing*1000:.0f}ms | FEC: {old_redundancy}x->{fec_redundancy}x")
+                                
                                 packets_sent_burst = 0
-                                last_burst_reset = now
-                                time.sleep(current_pacing)
+                                last_pacing_adjust = now
                 elif raw_chunk == b'':
                     print("[FIM] Vídeo terminou.")
                     ffmpeg_source.close()
@@ -712,8 +768,9 @@ def main():
                                         playback_started = False  # Aguardar buffer
                                         print(f"\n{'='*70}")
                                         print(f"[CLIENTE-INIT] Primeiro pacote recebido: seq={recv_seq}")
-                                        print(f"[CLIENTE-INIT] Jitter buffer: 300ms (15 pacotes)")
-                                        print(f"[CLIENTE-INIT] FEC: k=3 (33% overhead) + NACK 50ms")
+                                        print(f"[CLIENTE-INIT] Buffer ADAPTATIVO: inicia em {jitter_buffer_delay*1000:.0f}ms")
+                                        print(f"[CLIENTE-INIT] FEC: k=4 (25% overhead) + NACK 30ms")
+                                        print(f"[CLIENTE-INIT] Adaptará buffer automaticamente (200-600ms)")
                                         print(f"{'='*70}")
                                     
                                     # Adicionar ao JITTER BUFFER em vez de reproduzir imediatamente
@@ -798,12 +855,13 @@ def main():
                                         # Atualizar expected_seq para depois do gap
                                         expected_seq = recv_seq
                                     
-                                    # REPRODUZIR DO JITTER BUFFER (aguarda 300ms)
-                                    if not playback_started and len(jitter_buffer) >= 15:  # Buffer otimizado (15 pacotes = 300ms)
+                                    # REPRODUZIR DO JITTER BUFFER (adaptativo)
+                                    if not playback_started and len(jitter_buffer) >= jitter_buffer_min_packets:
                                         playback_started = True
                                         print(f"\n{'='*70}")
                                         print(f"[CLIENTE-BUFFER] Iniciando playback")
-                                        print(f"[CLIENTE-BUFFER] Buffer acumulado: {len(jitter_buffer)} pacotes (300ms)")
+                                        print(f"[CLIENTE-BUFFER] Buffer acumulado: {len(jitter_buffer)} pacotes ({jitter_buffer_delay*1000:.0f}ms)")
+                                        print(f"[CLIENTE-BUFFER] Sistema ADAPTATIVO ativado")
                                         print(f"{'='*70}")
                                     
                                     if playback_started:

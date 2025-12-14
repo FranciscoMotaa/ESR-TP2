@@ -42,33 +42,42 @@ class OverlayNode:
         self.lsa_database: Dict[tuple, float] = {}
         self.pending_pings: Dict[int, float] = {}
     
-    def check_dead_neighbors(self, timeout=20.0):
+    def check_dead_neighbors(self, timeout=10.0):
         """Verifica vizinhos mortos e remove rotas que dependem deles"""
         now = time.time()
         dead_neighbors = []
         dead_info = {}  # Para guardar info de debug
         
-        for n_ip, info in self.neighbors.items():
-            time_since_seen = now - info.get('last_seen', now)
-            # Só considera morto se:
-            # 1. Passou MUITO tempo sem resposta (30 segundos = 30 HELLOs perdidos)
-            # 2. Já tinha visto este vizinho antes (last_seen != 0)
-            if time_since_seen > 30.0 and info.get('last_seen', 0) > 0:
+        for n_ip, info in list(self.neighbors.items()):
+            last_seen = info.get('last_seen', 0)
+            # Só verifica se já vimos este vizinho (last_seen > 0)
+            if last_seen == 0:
+                continue  # Vizinho recém descoberto, dar tempo
+            
+            time_since_seen = now - last_seen
+            # Considera morto se passou MUITO tempo sem resposta
+            if time_since_seen > timeout:
                 dead_neighbors.append(n_ip)
                 dead_info[n_ip] = time_since_seen
         
         if dead_neighbors:
             for dead_ip in dead_neighbors:
-                print(f"[{self.node_id}] ☠️ Vizinho MORTO detectado: {dead_ip} (sem resposta há {dead_info[dead_ip]:.1f}s)")
+                print(f"[{self.node_id}] ☠️ Vizinho MORTO: {dead_ip} (sem resposta há {dead_info[dead_ip]:.1f}s)")
                 del self.neighbors[dead_ip]
                 
-                # Invalidar rotas que usam esse vizinho
+                # REMOVER rotas que usam esse vizinho como next hop
+                routes_removed = []
                 for stream_id, entry in list(self.routing_table.items()):
                     if entry.proximo_salto_ip == dead_ip:
-                        print(f"[{self.node_id}] ❌ Rota para {stream_id} invalidada (next hop morto)")
-                        # Marcar com custo infinito para forçar recálculo
-                        entry.custo_acumulado = float('inf')
-                        entry.last_update = now
+                        print(f"[{self.node_id}] ❌ REMOVENDO rota para {stream_id} (next hop {dead_ip} morto)")
+                        routes_removed.append(stream_id)
+                        del self.routing_table[stream_id]
+                
+                # LIMPAR TODAS AS LSAs para permitir re-flood
+                if routes_removed:
+                    print(f"[{self.node_id}] 🧹 LIMPANDO TODAS as LSAs para permitir nova descoberta")
+                    self.lsa_database.clear()
+                    print(f"[{self.node_id}] 🔄 {len(routes_removed)} rota(s) removida(s), PRONTO para novos FLOODs")
         
         return dead_neighbors
 
@@ -176,11 +185,14 @@ class OverlayNode:
             # Silenciosamente ignorar (pode ser broadcast de nó distante)
             return None
 
-        # Verificar duplicados (Loop prevention)
+        # Verificar duplicados (Loop prevention) - MAS permitir se não temos rota
         lsa_key = (stream_id, origin_seq)
         if lsa_key in self.lsa_database:
-            # Flood duplicado, não propagar
-            return None
+            # Se já temos rota válida, ignorar duplicado
+            if stream_id in self.routing_table:
+                return None
+            # Se não temos rota, aceitar mesmo que seja duplicado (recuperação)
+            print(f"[{self.node_id}] 🔓 Aceitando FLOOD duplicado (sem rota válida)")
         self.lsa_database[lsa_key] = time.time()
         
         # DEBUG: Confirmar recepção de flood novo

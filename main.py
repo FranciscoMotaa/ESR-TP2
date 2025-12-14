@@ -160,15 +160,16 @@ def main():
     FLOOD_INTERVAL = 5.0  # Reduzido para propagar mudanças mais rápido
     JOIN_TIMEOUT = 5.0
     MONITOR_UPDATE_INTERVAL = 2.0
-    TREE_CHECK_INTERVAL = 3.0  # Reduzido para reagir mais rápido a mudanças
-    NEIGHBOR_CHECK_INTERVAL = 10.0  # Verifica vizinhos mortos a cada 10s
-    NEIGHBOR_TIMEOUT = 30.0  # Timeout conservador: 30 HELLOs perdidos
+    TREE_CHECK_INTERVAL = 2.0  # Verificação rápida da árvore
+    NEIGHBOR_CHECK_INTERVAL = 5.0  # Verifica vizinhos mortos a cada 5s
+    NEIGHBOR_TIMEOUT = 10.0  # 10 HELLOs perdidos = morto (10 segundos)
 
     inputs = [sock, sys.stdin]
     frame_seq = 0
     stats_frames_received = 0
     stats_frames_lost = 0  
     last_seq_received = -1
+    last_frame_received_time = 0.0  # Para detetar perda de stream
     
     print("[*] Sistema pronto.")
     
@@ -203,19 +204,107 @@ def main():
                         else:
                             join_state['active'] = False
             
-            # --- 1.4. VERIFICAR VIZINHOS MORTOS (DESABILITADO) ---
-            # Desabilitado temporariamente para evitar falsos positivos
-            # A reconexão será tratada pelo mecanismo de Tree Maintenance
-            pass
+            # --- 1.4. VERIFICAR VIZINHOS MORTOS (ATIVADO) ---
+            if now - last_neighbor_check >= NEIGHBOR_CHECK_INTERVAL:
+                dead_neighbors = node.check_dead_neighbors(timeout=NEIGHBOR_TIMEOUT)
+                if dead_neighbors:
+                    print(f"[☠️] {len(dead_neighbors)} vizinho(s) morto(s) detectado(s)!")
+                    # FORÇAR RE-FLOOD para atualizar rotas (STREAMERS)
+                    if "STREAMER" in args.node_id:
+                        print(f"[{args.node_id}] 🔄 Forçando RE-FLOOD após perda de vizinho")
+                        flood_payload = json.dumps({
+                            "stream_id": args.node_id, "cost": 0, "origin_seq": int(now * 1000)
+                        }).encode('utf-8')
+                        for n_ip in node.neighbors:
+                            pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload)
+                            sock.sendto(pkt, (n_ip, DEFAULT_PORT))
+                        last_flood = now
+                    
+                    # ROUTERS: Re-propagar rotas que ainda temos
+                    else:
+                        routes_to_repropagate = []
+                        for stream_id, entry in node.routing_table.items():
+                            if entry.proximo_salto_ip != "SELF":  # Não propagar se formos a fonte
+                                routes_to_repropagate.append((stream_id, entry.custo_acumulado))
+                        
+                        if routes_to_repropagate:
+                            print(f"[{args.node_id}] 🔄 Re-propagando {len(routes_to_repropagate)} rota(s) via caminhos alternativos")
+                            for stream_id, cost in routes_to_repropagate:
+                                # Usar timestamp muito granular para garantir origin_seq único
+                                unique_seq = int(time.time() * 1000000) % 2147483647
+                                flood_payload = json.dumps({
+                                    "stream_id": stream_id, "cost": cost, "origin_seq": unique_seq
+                                }).encode('utf-8')
+                                for n_ip in node.neighbors:
+                                    if n_ip not in dead_neighbors:  # Não enviar para mortos
+                                        pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload)
+                                        sock.sendto(pkt, (n_ip, DEFAULT_PORT))
+                                        print(f"[{args.node_id}]   → Enviando para {n_ip} (custo {cost:.2f})")
+                                time.sleep(0.01)  # Pequeno delay entre floods
+                
+                last_neighbor_check = now
             
-            # --- 1.5. REPARAÇÃO DA ÁRVORE (Tree Maintenance) ---
-            # Verifica se o melhor Next Hop mudou e força a re-conexão
-            if join_state.get('parent_ip') and now - last_tree_check >= TREE_CHECK_INTERVAL:
+            # --- 1.5. DETEÇÃO E RECUPERAÇÃO AUTOMÁTICA (CLIENTES) ---
+            # Executado SEMPRE (não depende de intervalo)
+            if "C" in args.node_id and join_state.get('stream_id'):
+                stream_id = join_state['stream_id']
+                current_parent = join_state.get('parent_ip')
+                
+                # CASO A: Tem pai mas não recebe frames (conexão morreu)
+                if current_parent and last_frame_received_time > 0:
+                    time_without_frames = now - last_frame_received_time
+                    if time_without_frames > 4.0:  # 4 segundos sem frames
+                        print(f"[🚨 STREAM PERDIDA] Sem frames há {time_without_frames:.1f}s!")
+                        print(f"[🔄] Resetando conexão para descobrir nova rota...")
+                        join_state['parent_ip'] = None
+                        join_state['active'] = False
+                        last_frame_received_time = 0.0
+                
+                # CASO B: Não tem pai E não está conectando → TENTAR RECONECTAR
+                if not current_parent and not join_state['active']:
+                    if stream_id in node.routing_table:
+                        entry = node.routing_table[stream_id]
+                        new_next_hop = entry.proximo_salto_ip
+                        
+                        # Debounce: esperar 1 segundo entre tentativas
+                        time_since_last = now - join_state.get('last_sent', 0)
+                        if time_since_last > 1.0:
+                            print(f"[🔌 AUTO-RECONEXÃO] Tentando reconectar a {stream_id}")
+                            print(f"    Rota: via {new_next_hop} (custo {entry.custo_acumulado:.2f})")
+                            
+                            # Enviar JOIN
+                            pl_join = json.dumps({"stream_id": stream_id}).encode('utf-8')
+                            pkt_join = node.pack_message(MsgType.STREAM_JOIN, new_next_hop, pl_join)
+                            sock.sendto(pkt_join, (new_next_hop, DEFAULT_PORT))
+                            
+                            join_state['active'] = True
+                            join_state['target_ip'] = new_next_hop
+                            join_state['last_sent'] = now
+                            join_state['retries'] = 0
+                    elif now - join_state.get('last_sent', 0) > 3.0:
+                        # Sem rota há mais de 3 segundos: avisar
+                        if int(now) % 5 == 0:  # Log a cada 5 segundos
+                            print(f"[⚠️] Aguardando rota para {stream_id}... (sem FLOODs)")
+                            join_state['last_sent'] = now  # Atualizar para evitar spam
+            
+            # --- 1.6. REPARAÇÃO DA ÁRVORE (Tree Maintenance) ---
+            # Verifica mudanças de rota e otimizações
+            if join_state.get('stream_id') and now - last_tree_check >= TREE_CHECK_INTERVAL:
                 stream_id = join_state.get('stream_id')
-                if stream_id and stream_id in node.routing_table:
+                current_parent = join_state.get('parent_ip')
+                
+                # CASO 1: Temos pai mas perdemos a rota (pai morreu)
+                if current_parent and stream_id not in node.routing_table:
+                    print(f"[🚨 FAILOVER] Rota para {stream_id} PERDIDA! Pai {current_parent} morreu")
+                    # Resetar estado - a lógica de auto-reconexão vai tratar
+                    join_state['parent_ip'] = None
+                    join_state['active'] = False
+                    print(f"[🔍] Aguardando novos FLOODs...")
+                
+                # CASO 2: Temos pai E rota, mas o next hop mudou (caminho melhor)
+                elif current_parent and stream_id in node.routing_table:
                     entry = node.routing_table[stream_id]
                     new_best_next_hop = entry.proximo_salto_ip
-                    current_parent = join_state['parent_ip']
                     
                     # A rota mudou significativamente?
                     if new_best_next_hop != current_parent and not join_state['active']:
@@ -359,9 +448,35 @@ def main():
                         elif header['type'] == MsgType.HELLO_RESPONSE: node.handle_hello_response(payload, sender_ip_real)
                         elif header['type'] == MsgType.ROUTE_DISCOVERY:
                             new_pl = node.handle_flood(header, payload, sender_ip_real)
-                            if new_pl: 
+                            if new_pl:
+                                num_propagated = 0
                                 for n in node.neighbors: 
-                                    if n!=sender_ip_real: sock.sendto(node.pack_message(MsgType.ROUTE_DISCOVERY, n, new_pl), (n, DEFAULT_PORT))
+                                    if n!=sender_ip_real: 
+                                        sock.sendto(node.pack_message(MsgType.ROUTE_DISCOVERY, n, new_pl), (n, DEFAULT_PORT))
+                                        num_propagated += 1
+                            
+                            # CRÍTICO: Se cliente recebeu FLOOD do stream que quer mas não tem pai → JOIN IMEDIATO!
+                            if "C" in args.node_id and join_state.get('stream_id'):
+                                try:
+                                    flood_data = json.loads(payload)
+                                    flood_stream_id = flood_data.get('stream_id')
+                                    
+                                    # É o stream que queremos E não temos pai?
+                                    if flood_stream_id == join_state['stream_id'] and not join_state.get('parent_ip') and not join_state['active']:
+                                        if flood_stream_id in node.routing_table:
+                                            entry = node.routing_table[flood_stream_id]
+                                            next_hop = entry.proximo_salto_ip
+                                            print(f"[⚡ FLOOD TRIGGER] Recebido FLOOD de {flood_stream_id}, conectando VIA {next_hop}!")
+                                            
+                                            pl_join = json.dumps({"stream_id": flood_stream_id}).encode('utf-8')
+                                            pkt_join = node.pack_message(MsgType.STREAM_JOIN, next_hop, pl_join)
+                                            sock.sendto(pkt_join, (next_hop, DEFAULT_PORT))
+                                            
+                                            join_state['active'] = True
+                                            join_state['target_ip'] = next_hop
+                                            join_state['last_sent'] = now
+                                            join_state['retries'] = 0
+                                except: pass
                         elif header['type'] == MsgType.STREAM_JOIN:
                             up, ack = node.handle_join(payload, sender_ip_real)
                             if ack: sock.sendto(node.pack_message(MsgType.ACK_JOIN, sender_ip_real, json.dumps({"stream_id": json.loads(payload)['stream_id']}).encode('utf-8')), (sender_ip_real, DEFAULT_PORT))
@@ -376,7 +491,9 @@ def main():
                             if join_state['active'] and sender_ip_real == join_state['target_ip']: 
                                 join_state['active'] = False
                                 join_state['parent_ip'] = sender_ip_real
-                                print(f"[✅] Ligação OK. Pai na Árvore: {join_state['parent_ip']}")
+                                last_frame_received_time = now  # Reset do timer ao conectar
+                                print(f"[✅ CONECTADO] Pai na Árvore: {join_state['parent_ip']}")
+                                print(f"[🎥] Stream ativa! Aguardando frames...")
 
 
                         elif header['type'] == MsgType.STREAM_LEAVE:
@@ -404,6 +521,7 @@ def main():
                                         d = seq - last_seq_received
                                         if d > 1 and d < 1000: stats_frames_lost += (d - 1)
                                     last_seq_received = seq
+                                    last_frame_received_time = now  # Marca timestamp de recepção
                                     ffplay_sink.write_data(base64.b64decode(info.get('data')))
                                     stats_frames_received += 1
                             except: pass
@@ -423,9 +541,26 @@ def main():
                             print(f"  - {sid}: via {entry.proximo_salto_ip} (custo={entry.custo_acumulado:.1f}, clientes={len(entry.downstream_ips)})")
                         
                         if join_state.get('stream_id'):
-                            print(f"\nStream ativa: {join_state['stream_id']}")
-                            print(f"  Pai: {join_state.get('parent_ip', 'N/A')}")
-                            print(f"  Status: {'Conectando...' if join_state['active'] else 'Conectado'}")
+                            stream_id = join_state['stream_id']
+                            parent = join_state.get('parent_ip')
+                            active = join_state['active']
+                            
+                            print(f"\nStream: {stream_id}")
+                            if parent and not active:
+                                print(f"  Status: ✅ CONECTADO")
+                                print(f"  Pai: {parent}")
+                                if last_frame_received_time > 0:
+                                    age = now - last_frame_received_time
+                                    print(f"  Último frame: há {age:.1f}s")
+                            elif active:
+                                print(f"  Status: 🔄 CONECTANDO...")
+                                print(f"  Target: {join_state.get('target_ip')}")
+                            else:
+                                print(f"  Status: ❌ DESCONECTADO")
+                                if stream_id in node.routing_table:
+                                    print(f"  Rota disponível: Sim (via {node.routing_table[stream_id].proximo_salto_ip})")
+                                else:
+                                    print(f"  Rota disponível: Não")
                         print()
                     elif cmd.startswith("join"):
                         parts = cmd.split()

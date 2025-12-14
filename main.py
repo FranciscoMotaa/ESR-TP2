@@ -116,7 +116,7 @@ def main():
     
     node = OverlayNode(args.node_id, my_ip, DEFAULT_PORT)
     for neighbor_ip in initial_neighbors:
-        node.neighbors[neighbor_ip] = {'metric': 50.0, 'last_seen': 0}
+        node.neighbors[neighbor_ip] = {'metric': 50.0, 'last_seen': time.time()}
 
     # Socket UDP
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -138,22 +138,31 @@ def main():
     if "STREAMER" in args.node_id:
         if current_video_file and os.path.exists(current_video_file):
             ffmpeg_source = FFmpegStreamer(current_video_file, quality='HIGH')
+            # CORREÇÃO CRÍTICA: STREAMER precisa de entrada na routing_table para enviar dados
+            from overlay_structs import RouteEntry
+            node.routing_table[args.node_id] = RouteEntry(args.node_id, "SELF", 0.0)
+            print(f"[*] STREAMER inicializado: {args.node_id} pronto para transmitir")
         else:
             print(f"[ERRO] Vídeo não encontrado: {current_video_file}")
             
     if "C" in args.node_id: ffplay_sink = FFplayPlayer()
 
     # Estado
-    join_state = {'active': False, 'stream_id': None, 'target_ip': None, 'last_sent': 0, 'retries': 0}
+    join_state = {'active': False, 'stream_id': None, 'target_ip': None, 'last_sent': 0, 'retries': 0, 'parent_ip': None}
     last_hello = 0
     last_flood = 0
     last_report = 0        
     last_monitor_update = 0
+    last_tree_check = 0
+    last_neighbor_check = 0
     
     HELLO_INTERVAL = 1.0 
-    FLOOD_INTERVAL = 10.0 
+    FLOOD_INTERVAL = 5.0  # Reduzido para propagar mudanças mais rápido
     JOIN_TIMEOUT = 5.0
     MONITOR_UPDATE_INTERVAL = 2.0
+    TREE_CHECK_INTERVAL = 3.0  # Reduzido para reagir mais rápido a mudanças
+    NEIGHBOR_CHECK_INTERVAL = 10.0  # Verifica vizinhos mortos a cada 10s
+    NEIGHBOR_TIMEOUT = 30.0  # Timeout conservador: 30 HELLOs perdidos
 
     inputs = [sock, sys.stdin]
     frame_seq = 0
@@ -177,8 +186,64 @@ def main():
                         sock.sendto(pk, (join_state['target_ip'], DEFAULT_PORT))
                         join_state['last_sent'] = now; join_state['retries'] += 1
                     else:
-                        print(f"[❌] Falha no JOIN.")
-                        join_state['active'] = False
+                        print(f"[❌] Falha no JOIN após 3 tentativas.")
+                        # Tentar encontrar rota alternativa
+                        if join_state['stream_id'] in node.routing_table:
+                            new_best_nh = node.routing_table[join_state['stream_id']].proximo_salto_ip
+                            if new_best_nh != join_state['target_ip']:
+                                print(f"[🔄] Tentando rota alternativa via {new_best_nh}")
+                                join_state['target_ip'] = new_best_nh
+                                pl = json.dumps({"stream_id": join_state['stream_id']}).encode('utf-8')
+                                pkt = node.pack_message(MsgType.STREAM_JOIN, join_state['target_ip'], pl)
+                                sock.sendto(pkt, (join_state['target_ip'], DEFAULT_PORT))
+                                join_state['last_sent'] = now
+                                join_state['retries'] = 0  # Reset retries
+                            else:
+                                join_state['active'] = False
+                        else:
+                            join_state['active'] = False
+            
+            # --- 1.4. VERIFICAR VIZINHOS MORTOS (DESABILITADO) ---
+            # Desabilitado temporariamente para evitar falsos positivos
+            # A reconexão será tratada pelo mecanismo de Tree Maintenance
+            pass
+            
+            # --- 1.5. REPARAÇÃO DA ÁRVORE (Tree Maintenance) ---
+            # Verifica se o melhor Next Hop mudou e força a re-conexão
+            if join_state.get('parent_ip') and now - last_tree_check >= TREE_CHECK_INTERVAL:
+                stream_id = join_state.get('stream_id')
+                if stream_id and stream_id in node.routing_table:
+                    entry = node.routing_table[stream_id]
+                    new_best_next_hop = entry.proximo_salto_ip
+                    current_parent = join_state['parent_ip']
+                    
+                    # A rota mudou significativamente?
+                    if new_best_next_hop != current_parent and not join_state['active']:
+                        # Verificar se a mudança é recente (últimos 2 intervalos de FLOOD)
+                        time_since_update = now - entry.last_update
+                        if time_since_update < (FLOOD_INTERVAL * 2):
+                            print(f"[REPARO 🔄] Mudança de rota detectada para {stream_id}:")
+                            print(f"    Pai antigo: {current_parent}")
+                            print(f"    Novo NH: {new_best_next_hop} (custo {entry.custo_acumulado:.2f})")
+                            
+                            # 1. Enviar LEAVE ao antigo pai
+                            pl_leave = json.dumps({"stream_id": stream_id}).encode('utf-8')
+                            pkt_leave = node.pack_message(MsgType.STREAM_LEAVE, current_parent, pl_leave)
+                            sock.sendto(pkt_leave, (current_parent, DEFAULT_PORT))
+                            
+                            # 2. Iniciar novo JOIN
+                            pl_join = json.dumps({"stream_id": stream_id}).encode('utf-8')
+                            pkt_join = node.pack_message(MsgType.STREAM_JOIN, new_best_next_hop, pl_join)
+                            sock.sendto(pkt_join, (new_best_next_hop, DEFAULT_PORT))
+                            
+                            # 3. Atualizar estado
+                            join_state['active'] = True
+                            join_state['target_ip'] = new_best_next_hop
+                            join_state['last_sent'] = now
+                            join_state['retries'] = 0
+                        
+                last_tree_check = now
+
 
             # --- 2. HELLOS ---
             if now - last_hello >= HELLO_INTERVAL:
@@ -188,14 +253,20 @@ def main():
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
                 last_hello = now
 
-            # --- 3. FLOOD ---
+            # --- 3. FLOOD (STREAMERS INICIAM) ---
             if "STREAMER" in args.node_id and now - last_flood >= FLOOD_INTERVAL:
                 flood_payload = json.dumps({
                     "stream_id": args.node_id, "cost": 0, "origin_seq": int(now)
                 }).encode('utf-8')
+                num_sent = 0
                 for n_ip in node.neighbors:
                     pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload)
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
+                    num_sent += 1
+                if num_sent > 0:
+                    print(f"[{args.node_id}] 📡 FLOOD enviado para {num_sent} vizinhos")
+                else:
+                    print(f"[{args.node_id}] ⚠️ FLOOD NÃO ENVIADO: sem vizinhos!")
                 last_flood = now
 
             # --- 3.5. TELEMETRIA (COM IPs PARA A ÁRVORE) ---
@@ -248,6 +319,10 @@ def main():
                                 pkt = node.pack_message(MsgType.STREAM_DATA, c, pl)
                                 sock.sendto(pkt, (c, DEFAULT_PORT))
                             time.sleep(0.001)
+                        elif frame_seq % 500 == 0:  # Debug a cada 500 frames
+                            print(f"[STREAMER] Frame {frame_seq}: sem clientes downstream")
+                    elif frame_seq % 500 == 0:
+                        print(f"[STREAMER] Frame {frame_seq}: entrada routing_table não existe!")
                 elif raw_chunk == b'': ffmpeg_source.close(); ffmpeg_source = None
 
             # --- EVENT LOOP ---
@@ -298,7 +373,12 @@ def main():
                                 except: pass
                                 if not is_srv: sock.sendto(node.pack_message(MsgType.STREAM_JOIN, up, payload), (up, DEFAULT_PORT))
                         elif header['type'] == MsgType.ACK_JOIN:
-                            if join_state['active']: join_state['active'] = False; print(f"[✅] Ligação OK.")
+                            if join_state['active'] and sender_ip_real == join_state['target_ip']: 
+                                join_state['active'] = False
+                                join_state['parent_ip'] = sender_ip_real
+                                print(f"[✅] Ligação OK. Pai na Árvore: {join_state['parent_ip']}")
+
+
                         elif header['type'] == MsgType.STREAM_LEAVE:
                             up = node.handle_leave(payload, sender_ip_real)
                             if up and up!="SOURCE": sock.sendto(node.pack_message(MsgType.STREAM_LEAVE, up, payload), (up, DEFAULT_PORT))
@@ -332,8 +412,21 @@ def main():
                 elif s is sys.stdin:
                     cmd = sys.stdin.readline().strip()
                     if cmd == "status":
-                        print(f"--- {args.node_id} ---")
-                        for k,v in node.neighbors.items(): print(f"-> {k}: {v.get('metric',0):.1f}ms")
+                        print(f"\n=== STATUS {args.node_id} ===")
+                        print(f"Vizinhos ativos: {len(node.neighbors)}")
+                        for n_ip, info in node.neighbors.items():
+                            age = now - info.get('last_seen', 0)
+                            print(f"  - {n_ip}: RTT={info.get('metric', 0):.1f}ms (visto há {age:.1f}s)")
+                        
+                        print(f"\nTabela de Roteamento: {len(node.routing_table)} entradas")
+                        for sid, entry in node.routing_table.items():
+                            print(f"  - {sid}: via {entry.proximo_salto_ip} (custo={entry.custo_acumulado:.1f}, clientes={len(entry.downstream_ips)})")
+                        
+                        if join_state.get('stream_id'):
+                            print(f"\nStream ativa: {join_state['stream_id']}")
+                            print(f"  Pai: {join_state.get('parent_ip', 'N/A')}")
+                            print(f"  Status: {'Conectando...' if join_state['active'] else 'Conectado'}")
+                        print()
                     elif cmd.startswith("join"):
                         parts = cmd.split()
                         if len(parts) > 1:
@@ -342,7 +435,16 @@ def main():
                                 nh = node.routing_table[target].proximo_salto_ip
                                 pl = json.dumps({"stream_id": target}).encode('utf-8')
                                 sock.sendto(node.pack_message(MsgType.STREAM_JOIN, nh, pl), (nh, DEFAULT_PORT))
-                                join_state={'active':True, 'stream_id':target, 'target_ip':nh, 'last_sent':time.time(), 'retries':0}
+                                
+                                # Reset do estado de JOIN, mas 'parent_ip' é None até receber ACK
+                                join_state={
+                                    'active':True, 
+                                    'stream_id':target, 
+                                    'target_ip':nh, 
+                                    'last_sent':time.time(), 
+                                    'retries':0, 
+                                    'parent_ip':None # <--- NOVO
+                                }
                                 print(f"[🔌] Joining {nh}...")
                             else: print("[!] Sem rota.")
 

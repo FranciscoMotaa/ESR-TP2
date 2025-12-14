@@ -41,6 +41,36 @@ class OverlayNode:
         self.routing_table: Dict[str, RouteEntry] = {}
         self.lsa_database: Dict[tuple, float] = {}
         self.pending_pings: Dict[int, float] = {}
+    
+    def check_dead_neighbors(self, timeout=20.0):
+        """Verifica vizinhos mortos e remove rotas que dependem deles"""
+        now = time.time()
+        dead_neighbors = []
+        dead_info = {}  # Para guardar info de debug
+        
+        for n_ip, info in self.neighbors.items():
+            time_since_seen = now - info.get('last_seen', now)
+            # Só considera morto se:
+            # 1. Passou MUITO tempo sem resposta (30 segundos = 30 HELLOs perdidos)
+            # 2. Já tinha visto este vizinho antes (last_seen != 0)
+            if time_since_seen > 30.0 and info.get('last_seen', 0) > 0:
+                dead_neighbors.append(n_ip)
+                dead_info[n_ip] = time_since_seen
+        
+        if dead_neighbors:
+            for dead_ip in dead_neighbors:
+                print(f"[{self.node_id}] ☠️ Vizinho MORTO detectado: {dead_ip} (sem resposta há {dead_info[dead_ip]:.1f}s)")
+                del self.neighbors[dead_ip]
+                
+                # Invalidar rotas que usam esse vizinho
+                for stream_id, entry in list(self.routing_table.items()):
+                    if entry.proximo_salto_ip == dead_ip:
+                        print(f"[{self.node_id}] ❌ Rota para {stream_id} invalidada (next hop morto)")
+                        # Marcar com custo infinito para forçar recálculo
+                        entry.custo_acumulado = float('inf')
+                        entry.last_update = now
+        
+        return dead_neighbors
 
     def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"") -> bytes:
         self.sequence_number += 1
@@ -74,15 +104,20 @@ class OverlayNode:
         return b""
 
     def handle_hello_response(self, payload, sender_ip):
+        now = time.time()
         try:
             data = json.loads(payload.decode('utf-8'))
             ack_seq = data['ack_seq']
             if ack_seq in self.pending_pings:
                 start_time = self.pending_pings.pop(ack_seq)
-                rtt_ms = (time.time() - start_time) * 1000.0 
-                old_metric = self.neighbors.get(sender_ip, {}).get('metric', rtt_ms)
-                new_metric = (0.7 * old_metric) + (0.3 * rtt_ms)
-                self.neighbors[sender_ip]['metric'] = new_metric
+                rtt_ms = (now - start_time) * 1000.0 
+                
+                # CRÍTICO: Atualizar last_seen sempre que recebemos resposta
+                if sender_ip in self.neighbors:
+                    old_metric = self.neighbors[sender_ip].get('metric', rtt_ms)
+                    new_metric = (0.7 * old_metric) + (0.3 * rtt_ms)
+                    self.neighbors[sender_ip]['metric'] = new_metric
+                    self.neighbors[sender_ip]['last_seen'] = now  #FIX!
         except: pass
 
     '''def handle_flood(self, header, payload, sender_ip_real):
@@ -128,55 +163,86 @@ class OverlayNode:
         except: return None
 
         # Modo Estrito: Ignorar flood de desconhecidos
-        if sender_ip_real not in self.neighbors: return None
+        if sender_ip_real not in self.neighbors:
+            print(f"[{self.node_id}] ⚠️ FLOOD ignorado: {sender_ip_real} não é vizinho")
+            return None
+        
+        # Verificar se vizinho está respondendo aos HELLOs (verificação leve)
+        neighbor_info = self.neighbors[sender_ip_real]
+        time_since_seen = time.time() - neighbor_info.get('last_seen', 0)
+        # Aceitar floods mesmo de vizinhos que não respondem (broadcast),
+        # mas dar preferência a rotas de vizinhos ativos
+        if time_since_seen > 60.0:  # Muito tempo sem resposta (1 minuto)
+            # Silenciosamente ignorar (pode ser broadcast de nó distante)
+            return None
 
         # Verificar duplicados (Loop prevention)
         lsa_key = (stream_id, origin_seq)
-        if lsa_key in self.lsa_database: return None
+        if lsa_key in self.lsa_database:
+            # Flood duplicado, não propagar
+            return None
         self.lsa_database[lsa_key] = time.time()
+        
+        # DEBUG: Confirmar recepção de flood novo
+        print(f"[{self.node_id}] 📡 Flood recebido: {stream_id} de {sender_ip_real} (custo={custo_recebido:.2f})")
 
         metric_link = self.neighbors[sender_ip_real]['metric']
         novo_custo = custo_recebido + metric_link
 
-        # --- AQUI COMEÇA A MUDANÇA CRÍTICA ---
+        # --- LÓGICA DE ROTEAMENTO DINÂMICO ---
         should_propagate = False
-        CHANGE_THRESHOLD = 0.05 # 5% de Histerese (reduzido para aceitar mais caminhos)
+        route_changed = False
 
         if stream_id not in self.routing_table:
             # Rota nova: Aceitar sempre
             self.routing_table[stream_id] = RouteEntry(stream_id, sender_ip_real, novo_custo)
+            self.routing_table[stream_id].last_update = time.time()
             should_propagate = True
+            route_changed = True
+            print(f"[{self.node_id}] 🆕 Nova rota para {stream_id}: via {sender_ip_real} (custo {novo_custo:.2f})")
         else:
             rota = self.routing_table[stream_id]
+            old_next_hop = rota.proximo_salto_ip
+            old_cost = rota.custo_acumulado
             
-            # CASO 1: Encontrámos um caminho MELHOR (mesmo que ligeiramente)
-            # Aceitar se for melhor, considerando threshold para evitar oscilação
-            if novo_custo < rota.custo_acumulado * (1 - CHANGE_THRESHOLD):
-                print(f"[{self.node_id}] 🔄 Caminho MELHOR para {stream_id}: {sender_ip_real} (custo {novo_custo:.2f} < {rota.custo_acumulado:.2f})")
+            # CASO 1: Encontrámos um caminho SIGNIFICATIVAMENTE MELHOR
+            if novo_custo < old_cost * 0.90:  # 10% melhor
+                print(f"[{self.node_id}] 🔄 Caminho MELHOR para {stream_id}: {sender_ip_real} (custo {novo_custo:.2f} << {old_cost:.2f})")
                 rota.proximo_salto_ip = sender_ip_real
                 rota.custo_acumulado = novo_custo
+                rota.last_update = time.time()
                 should_propagate = True
+                route_changed = True
             
-            # CASO 2: O caminho ATUAL piorou (Upper bound / Congestionamento)
-            # Se o meu fornecedor atual diz que o custo subiu, aceitar
-            elif sender_ip_real == rota.proximo_salto_ip:
-                if novo_custo > rota.custo_acumulado * (1 + CHANGE_THRESHOLD):
-                     print(f"[{self.node_id}] ⚠️  Caminho PIOROU para {stream_id}: custo {novo_custo:.2f} > {rota.custo_acumulado:.2f}")
-                     rota.custo_acumulado = novo_custo
-                     should_propagate = True
+            # CASO 2: Atualização do caminho ATUAL (mesmo Next Hop)
+            elif sender_ip_real == old_next_hop:
+                # Sempre aceitar atualizações do next hop atual
+                if abs(novo_custo - old_cost) > 1.0:  # Mudança significativa
+                    if novo_custo > old_cost:
+                        print(f"[{self.node_id}] ⚠️ Caminho PIOROU para {stream_id}: custo {novo_custo:.2f} (era {old_cost:.2f})")
+                    else:
+                        print(f"[{self.node_id}] ✅ Caminho melhorou para {stream_id}: custo {novo_custo:.2f} (era {old_cost:.2f})")
+                rota.custo_acumulado = novo_custo
+                rota.last_update = time.time()
+                should_propagate = True
+                # Não marcamos route_changed porque o next_hop é o mesmo
             
-            # CASO 3: Caminho alternativo competitivo (novo!)
-            # Aceitar caminhos alternativos que sejam razoavelmente bons
-            elif novo_custo <= rota.custo_acumulado * (1 + CHANGE_THRESHOLD * 2):
-                print(f"[{self.node_id}] 🔀 Caminho ALTERNATIVO para {stream_id}: {sender_ip_real} (custo {novo_custo:.2f} vs atual {rota.custo_acumulado:.2f})")
-                # Não mudamos a rota principal, mas propagamos para dar visibilidade
+            # CASO 3: Caminho alternativo bom (pode ser útil para failover)
+            elif novo_custo < old_cost * 1.20:  # Até 20% pior que o atual
+                # Não mudamos a rota, mas propagamos para dar visibilidade
+                print(f"[{self.node_id}] 🔀 Caminho ALTERNATIVO para {stream_id}: via {sender_ip_real} (custo {novo_custo:.2f} vs {old_cost:.2f})")
                 should_propagate = True
 
         if should_propagate:
             data['cost'] = novo_custo
-            # Pequeno Jitter para evitar "Broadcast Storms" síncronas
-            time.sleep(0.005) 
+            # Marca se houve mudança de next hop para downstream nodes saberem
+            if route_changed:
+                data['route_changed'] = True
+            print(f"[{self.node_id}] ➡️ Propagando flood {stream_id} (custo {novo_custo:.2f})")
+            time.sleep(0.002)  # Pequeno jitter
             return json.dumps(data).encode('utf-8')
+        else:
+            print(f"[{self.node_id}] 🚫 NÃO propagando {stream_id} (custo {novo_custo:.2f} não melhora {self.routing_table.get(stream_id, RouteEntry('', '', float('inf'))).custo_acumulado:.2f})")
             
         return None
     
@@ -193,10 +259,13 @@ class OverlayNode:
         if self.node_id == target_stream:
             if target_stream not in self.routing_table:
                 self.routing_table[target_stream] = RouteEntry(target_stream, "SELF", 0.0)
+                print(f"[{self.node_id}] 📝 Entrada de roteamento criada para SELF")
             entry = self.routing_table[target_stream]
             if sender_ip_real not in entry.downstream_ips:
                 entry.downstream_ips.add(sender_ip_real)
-                print(f"[{self.node_id}] 🎬 NOVO CLIENTE: {sender_ip_real}")
+                print(f"[{self.node_id}] 🎬 NOVO CLIENTE: {sender_ip_real} (total: {len(entry.downstream_ips)})")
+            else:
+                print(f"[{self.node_id}] ⚠️ Cliente já existe: {sender_ip_real}")
             return "SOURCE", True # True = Enviar ACK
 
         # Se sou Router

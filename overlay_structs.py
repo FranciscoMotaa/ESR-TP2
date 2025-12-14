@@ -42,7 +42,7 @@ class OverlayNode:
         self.lsa_database: Dict[tuple, float] = {}
         self.pending_pings: Dict[int, float] = {}
     
-    def check_dead_neighbors(self, timeout=10.0):
+    def check_dead_neighbors(self, timeout=20.0):
         """Verifica vizinhos mortos e remove rotas que dependem deles"""
         now = time.time()
         dead_neighbors = []
@@ -50,15 +50,18 @@ class OverlayNode:
         
         for n_ip, info in list(self.neighbors.items()):
             last_seen = info.get('last_seen', 0)
-            # Só verifica se já vimos este vizinho (last_seen > 0)
-            if last_seen == 0:
+            
+            # Só verifica se já vimos este vizinho há algum tempo
+            if last_seen == 0 or last_seen == now:
                 continue  # Vizinho recém descoberto, dar tempo
             
             time_since_seen = now - last_seen
-            # Considera morto se passou MUITO tempo sem resposta
+            
+            # CONSERVADOR: Só marca morto se passou MUITO tempo
             if time_since_seen > timeout:
                 dead_neighbors.append(n_ip)
                 dead_info[n_ip] = time_since_seen
+                print(f"[{self.node_id}] ⚠️ Vizinho {n_ip} sem resposta há {time_since_seen:.1f}s (timeout={timeout}s)")
         
         if dead_neighbors:
             for dead_ip in dead_neighbors:
@@ -108,6 +111,7 @@ class OverlayNode:
         now = time.time()
         # Modo Estrito: Só responder se for vizinho conhecido
         if sender_ip in self.neighbors:
+            # SEMPRE atualizar last_seen quando recebe HELLO
             self.neighbors[sender_ip]['last_seen'] = now
             return json.dumps({"ack_seq": header['seq']}).encode('utf-8')
         return b""

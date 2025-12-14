@@ -161,8 +161,8 @@ def main():
     JOIN_TIMEOUT = 5.0
     MONITOR_UPDATE_INTERVAL = 2.0
     TREE_CHECK_INTERVAL = 2.0  # Verificação rápida da árvore
-    NEIGHBOR_CHECK_INTERVAL = 5.0  # Verifica vizinhos mortos a cada 5s
-    NEIGHBOR_TIMEOUT = 10.0  # 10 HELLOs perdidos = morto (10 segundos)
+    NEIGHBOR_CHECK_INTERVAL = 8.0  # Verifica vizinhos mortos a cada 8s
+    NEIGHBOR_TIMEOUT = 20.0  # 20 HELLOs perdidos = morto (CONSERVADOR)
 
     inputs = [sock, sys.stdin]
     frame_seq = 0
@@ -209,6 +209,14 @@ def main():
                 dead_neighbors = node.check_dead_neighbors(timeout=NEIGHBOR_TIMEOUT)
                 if dead_neighbors:
                     print(f"[☠️] {len(dead_neighbors)} vizinho(s) morto(s) detectado(s)!")
+                    
+                    # CLIENTES: Se pai morreu, forçar desconexão imediata
+                    if "C" in args.node_id and join_state.get('parent_ip') in dead_neighbors:
+                        print(f"[🚨 PAI MORTO] {join_state['parent_ip']} não responde!")
+                        join_state['parent_ip'] = None
+                        join_state['active'] = False
+                        print(f"[🔍] Procurando rota alternativa...")
+                    
                     # FORÇAR RE-FLOOD para atualizar rotas (STREAMERS)
                     if "STREAMER" in args.node_id:
                         print(f"[{args.node_id}] 🔄 Forçando RE-FLOOD após perda de vizinho")
@@ -249,19 +257,23 @@ def main():
             if "C" in args.node_id and join_state.get('stream_id'):
                 stream_id = join_state['stream_id']
                 current_parent = join_state.get('parent_ip')
+                is_connecting = join_state.get('active', False)
                 
-                # CASO A: Tem pai mas não recebe frames (conexão morreu)
-                if current_parent and last_frame_received_time > 0:
+                # CASO A: Estava a receber frames mas já não recebe (CRÍTICO!)
+                # Verifica SEMPRE, independentemente de ter pai ou não
+                if last_frame_received_time > 0:
                     time_without_frames = now - last_frame_received_time
-                    if time_without_frames > 4.0:  # 4 segundos sem frames
-                        print(f"[🚨 STREAM PERDIDA] Sem frames há {time_without_frames:.1f}s!")
-                        print(f"[🔄] Resetando conexão para descobrir nova rota...")
+                    # Se parou de receber frames E tem pai marcado → RESETAR!
+                    if time_without_frames > 4.0 and current_parent:
+                        print(f"[🚨 CONEXÃO PERDIDA] Sem frames há {time_without_frames:.1f}s!")
+                        print(f"[🔄] Pai {current_parent} pode estar morto, resetando...")
                         join_state['parent_ip'] = None
                         join_state['active'] = False
-                        last_frame_received_time = 0.0
+                        # NÃO resetar last_frame_received_time aqui - mantém para tracking
                 
-                # CASO B: Não tem pai E não está conectando → TENTAR RECONECTAR
-                if not current_parent and not join_state['active']:
+                # CASO B: Não tem pai conectado → TENTAR RECONECTAR
+                if not current_parent and not is_connecting:
+                    # Verifica se tem rota disponível
                     if stream_id in node.routing_table:
                         entry = node.routing_table[stream_id]
                         new_next_hop = entry.proximo_salto_ip
@@ -269,8 +281,8 @@ def main():
                         # Debounce: esperar 1 segundo entre tentativas
                         time_since_last = now - join_state.get('last_sent', 0)
                         if time_since_last > 1.0:
-                            print(f"[🔌 AUTO-RECONEXÃO] Tentando reconectar a {stream_id}")
-                            print(f"    Rota: via {new_next_hop} (custo {entry.custo_acumulado:.2f})")
+                            print(f"[🔌 AUTO-RECONEXÃO] Rota encontrada para {stream_id}")
+                            print(f"    Via: {new_next_hop} (custo {entry.custo_acumulado:.2f})")
                             
                             # Enviar JOIN
                             pl_join = json.dumps({"stream_id": stream_id}).encode('utf-8')
@@ -281,11 +293,12 @@ def main():
                             join_state['target_ip'] = new_next_hop
                             join_state['last_sent'] = now
                             join_state['retries'] = 0
-                    elif now - join_state.get('last_sent', 0) > 3.0:
-                        # Sem rota há mais de 3 segundos: avisar
-                        if int(now) % 5 == 0:  # Log a cada 5 segundos
-                            print(f"[⚠️] Aguardando rota para {stream_id}... (sem FLOODs)")
-                            join_state['last_sent'] = now  # Atualizar para evitar spam
+                    else:
+                        # Sem rota: Log periódico
+                        time_since_last = now - join_state.get('last_sent', 0)
+                        if time_since_last > 5.0:  # A cada 5 segundos
+                            print(f"[⚠️] DESCONECTADO: Aguardando FLOODs de {stream_id}...")
+                            join_state['last_sent'] = now
             
             # --- 1.6. REPARAÇÃO DA ÁRVORE (Tree Maintenance) ---
             # Verifica mudanças de rota e otimizações
@@ -336,10 +349,15 @@ def main():
 
             # --- 2. HELLOS ---
             if now - last_hello >= HELLO_INTERVAL:
+                num_sent = 0
                 for n_ip in node.neighbors:
                     pkt = node.pack_message(MsgType.HELLO, n_ip, b"")
                     node.pending_pings[node.sequence_number] = now
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
+                    num_sent += 1
+                # Debug periódico
+                if int(now) % 10 == 0 and num_sent > 0:
+                    print(f"[{args.node_id}] 💓 Enviando HELLOs para {num_sent} vizinhos")
                 last_hello = now
 
             # --- 3. FLOOD (STREAMERS INICIAM) ---
@@ -434,7 +452,9 @@ def main():
                                 # O Tracker estrito já filtrou, então podemos confiar
                                 new_ip = note.get('new_neighbor')
                                 if new_ip and new_ip not in node.neighbors:
-                                    node.neighbors[new_ip] = {'metric': 50.0, 'last_seen': time.time()}
+                                    # Inicializar com timestamp atual
+                                    node.neighbors[new_ip] = {'metric': 50.0, 'last_seen': now}
+                                    print(f"[{args.node_id}] 👋 Novo vizinho: {new_ip}")
                                     pkt = node.pack_message(MsgType.HELLO, new_ip, b"")
                                     sock.sendto(pkt, (new_ip, DEFAULT_PORT))
                                 continue
@@ -492,6 +512,10 @@ def main():
                                 join_state['active'] = False
                                 join_state['parent_ip'] = sender_ip_real
                                 last_frame_received_time = now  # Reset do timer ao conectar
+                                # Reset stats para nova conexão
+                                stats_frames_received = 0
+                                stats_frames_lost = 0
+                                last_seq_received = -1
                                 print(f"[✅ CONECTADO] Pai na Árvore: {join_state['parent_ip']}")
                                 print(f"[🎥] Stream ativa! Aguardando frames...")
 
@@ -520,6 +544,11 @@ def main():
                                     if last_seq_received != -1:
                                         d = seq - last_seq_received
                                         if d > 1 and d < 1000: stats_frames_lost += (d - 1)
+                                    
+                                    # Log quando primeiro frame chega após reconexão
+                                    if stats_frames_received == 0 or (last_seq_received == -1):
+                                        print(f"[🎬 PRIMEIRO FRAME] Stream iniciada! (seq={seq})")
+                                    
                                     last_seq_received = seq
                                     last_frame_received_time = now  # Marca timestamp de recepção
                                     ffplay_sink.write_data(base64.b64decode(info.get('data')))
@@ -547,20 +576,29 @@ def main():
                             
                             print(f"\nStream: {stream_id}")
                             if parent and not active:
-                                print(f"  Status: ✅ CONECTADO")
-                                print(f"  Pai: {parent}")
+                                # Verificar se pai ainda está vivo
+                                parent_alive = parent in node.neighbors
                                 if last_frame_received_time > 0:
                                     age = now - last_frame_received_time
-                                    print(f"  Último frame: há {age:.1f}s")
+                                    if age < 5.0:
+                                        print(f"  Status: ✅ CONECTADO e ATIVO")
+                                    else:
+                                        print(f"  Status: ⚠️ CONECTADO mas SEM FRAMES ({age:.1f}s)")
+                                else:
+                                    print(f"  Status: 🔗 CONECTADO (aguardando frames)")
+                                print(f"  Pai: {parent} {'✅ vivo' if parent_alive else '⚠️ morto/desconhecido'}")
+                                print(f"  Frames recebidos: {stats_frames_received}")
                             elif active:
                                 print(f"  Status: 🔄 CONECTANDO...")
                                 print(f"  Target: {join_state.get('target_ip')}")
+                                print(f"  Tentativas: {join_state.get('retries', 0)}")
                             else:
                                 print(f"  Status: ❌ DESCONECTADO")
                                 if stream_id in node.routing_table:
-                                    print(f"  Rota disponível: Sim (via {node.routing_table[stream_id].proximo_salto_ip})")
+                                    entry = node.routing_table[stream_id]
+                                    print(f"  Rota disponível: ✅ via {entry.proximo_salto_ip} (custo {entry.custo_acumulado:.1f})")
                                 else:
-                                    print(f"  Rota disponível: Não")
+                                    print(f"  Rota disponível: ❌ Não (aguardando FLOODs)")
                         print()
                     elif cmd.startswith("join"):
                         parts = cmd.split()

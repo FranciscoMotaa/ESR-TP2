@@ -3,86 +3,127 @@ import threading
 import json
 import sys
 import time
-import os
-import socket
-import threading
-import json
-import sys
-import time
 from datetime import datetime
 from collections import defaultdict
 
-# Configuração do Tracker
+# --- CONFIGURAÇÃO ---
 BIND_IP = "0.0.0.0"
 BIND_PORT = 6000
 MONITOR_PORT = 6001  # Porta UDP para receber updates de estado
-NODE_DEFAULT_PORT = 50000 # Porta que os nós usam para comunicação (e receber notificações)
+NODE_DEFAULT_PORT = 50000 # Porta padrão dos nós
 
-# Estruturas de dados para monitorização
+# --- ESTRUTURAS DE DADOS ---
 # node_state: {node_id: {'ip': ..., 'last_seen': ..., 'neighbors': {...}, 'routing_table': {...}, 'streams': [...]}}
 node_state = {}
 route_history = {}
 neighbor_discovery = {}
 state_lock = threading.Lock()
 
+# --- FUNÇÕES AUXILIARES ---
+
 def load_topology():
-    """Inicializa o Tracker em modo dinâmico."""
-    # Nenhuma topologia estática é carregada.
+    """Inicializa o Tracker (Modo Dinâmico)."""
     print("[*] Tracker inicializado. Descoberta de vizinhos dinâmica ativa.")
 
+def find_node_id_by_ip(target_ip):
+    """Encontra o ID do nó dado o seu IP."""
+    for nid, data in node_state.items():
+        # Verifica o IP principal
+        if target_ip == data.get('ip'):
+            return nid
+        # Se houver lista de IPs (multi-interface), verifica também
+        if target_ip in data.get('ips', []):
+            return nid
+    return target_ip  # Se não encontrar, devolve o próprio IP
+
+def print_tree(node_id, stream_id, prefix="", is_last=True, visited=None):
+    """Imprime a árvore de multicast recursivamente."""
+    if visited is None: visited = []
+    
+    connector = "└── " if is_last else "├── "
+    
+    # Marcador visual se for cliente (destino final)
+    suffix = ""
+    if "C" in node_id and "STREAMER" not in node_id:
+        suffix = " \033[92m(Cliente)\033[0m" # Verde se suportado pelo terminal
+    
+    print(f"{prefix}{connector}{node_id}{suffix}")
+    
+    new_prefix = prefix + ("    " if is_last else "│   ")
+    
+    children = []
+    if node_id in node_state:
+        routing_table = node_state[node_id].get('routing_table', {})
+        # Assume que a chave na routing table é o stream_id (ou node origem)
+        route_info = routing_table.get(stream_id, {})
+        # aceitar ambas as formas ('downstream' enviado por main.py, ou 'downstream_ips')
+        downstream_ips = route_info.get('downstream', None)
+        if downstream_ips is None:
+            downstream_ips = route_info.get('downstream_ips', [])
+        # garantir lista
+        if downstream_ips is None:
+            downstream_ips = []
+
+        
+        for ip in downstream_ips:
+            child_id = find_node_id_by_ip(ip)
+            # Evita adicionar o próprio nó como filho (loop local)
+            if child_id != node_id: 
+                children.append(child_id)
+        
+        children.sort()
+
+    for i, child_id in enumerate(children):
+        is_last_child = (i == len(children) - 1)
+        if child_id in visited:
+            print(f"{new_prefix}└── {child_id} [LOOP DETECTADO]")
+        else:
+            print_tree(child_id, stream_id, new_prefix, is_last_child, visited + [node_id])
+
+# --- LÓGICA DE REGISTO (TCP) ---
 
 def notify_new_node(new_node_id, new_node_ip):
     """Notifica todos os nós ativos sobre a entrada de um novo nó."""
-
     notification = json.dumps({
         "type": "neighbor_update",
         "new_neighbor": new_node_ip,
         "neighbor_id": new_node_id
     }).encode('utf-8')
 
-    print(f"[*] A notificar todos os nós ativos sobre o novo nó {new_node_id} ({new_node_ip}).")
+    print(f"[*] A notificar rede sobre novo nó {new_node_id} ({new_node_ip}).")
 
     with state_lock:
-        # Iterar sobre todos os nós já registados (exceto o próprio)
         for other_node_id, info in node_state.items():
             if other_node_id != new_node_id:
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    sock.settimeout(0.5)
-
+                    sock.settimeout(0.2)
                     other_ip = info['ip']
-                    # Enviar notificação para a porta padrão de comunicação do nó (50000)
                     sock.sendto(notification, (other_ip, NODE_DEFAULT_PORT))
                     sock.close()
-
                 except Exception:
-                    # Falha ao notificar um nó (pode estar offline ou inacessível)
                     pass
 
-
 def handle_client(client_sock, addr):
-    """Lida com pedidos de registo TCP (Bootstrapping Dinâmico)."""
+    """Lida com registo TCP (Bootstrap)."""
     try:
         data = client_sock.recv(1024)
-        if not data:
-            return
+        if not data: return
 
         request = json.loads(data.decode('utf-8'))
         node_id = request.get('id')
         node_ip = request.get('ip')
 
-        print(f"[TRACKER] Pedido de registo dinâmico de {node_id} ({node_ip})")
+        # print(f"[TRACKER] Registo: {node_id} ({node_ip})")
 
         response_neighbors = []
         is_new_registration = False
 
         with state_lock:
-            # 1. Obter a lista de *todos* os IPs de nós já ativos
-            # Estes IPs serão os vizinhos iniciais para o novo nó.
+            # Enviar IPs de todos os nós conhecidos como vizinhos potenciais
             all_active_ips = [info['ip'] for n_id, info in node_state.items() if n_id != node_id]
             response_neighbors = all_active_ips
 
-            # 2. Registar/Atualizar nó no estado
             if node_id not in node_state:
                 node_state[node_id] = {
                     'ip': node_ip,
@@ -92,226 +133,170 @@ def handle_client(client_sock, addr):
                     'streams': []
                 }
                 is_new_registration = True
-                print(f"   -> Novo nó {node_id} registado. Devolvendo {len(all_active_ips)} vizinhos iniciais.")
             else:
-                # Atualizar IP e last_seen em caso de reconexão
                 node_state[node_id]['ip'] = node_ip
                 node_state[node_id]['last_seen'] = time.time()
 
-        # 3. Enviar a lista de vizinhos (IPs dos nós ativos) ao novo nó
         response = json.dumps({"status": "OK", "neighbors": response_neighbors})
-        try:
-            client_sock.send(response.encode('utf-8'))
-        except Exception:
-            pass
+        client_sock.send(response.encode('utf-8'))
 
-        # 4. Notificar a rede sobre o novo nó (após enviar resposta)
         if is_new_registration:
             threading.Thread(target=notify_new_node, args=(node_id, node_ip), daemon=True).start()
 
     except Exception as e:
-        print(f"[ERRO] {e}")
+        print(f"[ERRO HANDLER] {e}")
     finally:
-        try:
-            client_sock.close()
-        except Exception:
-            pass
+        try: client_sock.close()
+        except: pass
 
+# --- MONITORIZAÇÃO (UDP) ---
 
 def handle_state_update(sock):
-    """Recebe updates de estado dos nós via UDP."""
+    """Processa updates de estado recebidos via UDP."""
     while True:
         try:
             data, addr = sock.recvfrom(8192)
             try:
                 update = json.loads(data.decode('utf-8'))
-            except Exception:
-                continue
+            except: continue
 
             node_id = update.get('node_id')
-            if not node_id:
-                continue
+            if not node_id: continue
 
             with state_lock:
-                # Inicializar estruturas para um nó recém-visto (se o TCP falhou ou foi ignorado)
-                if node_id not in node_state:
-                    node_state[node_id] = {
-                        'ip': addr[0],
-                        'last_seen': time.time(),
-                        'neighbors': {},
-                        'routing_table': {},
-                        'streams': []
-                    }
-                    neighbor_discovery[node_id] = {}
-                    route_history[node_id] = {}
-
                 current_time = time.time()
-
-                # Detectar novos vizinhos (descoberta dinâmica)
-                new_neighbors = update.get('neighbors', {})
-                if node_id in neighbor_discovery:
-                    for neighbor_ip in new_neighbors:
-                        if neighbor_ip not in neighbor_discovery[node_id]:
-                            neighbor_discovery[node_id][neighbor_ip] = current_time
-
-                # Detectar mudanças de rotas e logar (código inalterado)
-                new_routing_table = update.get('routing_table', {})
-                old_routing_table = node_state[node_id].get('routing_table', {})
-
-                for dest_id, new_route in new_routing_table.items():
-                    new_next_hop = new_route.get('next_hop')
-                    new_cost = new_route.get('cost', 0)
-
-                    if node_id not in route_history:
-                        route_history[node_id] = {}
-                    if dest_id not in route_history[node_id]:
-                        route_history[node_id][dest_id] = []
-
-                    if dest_id in old_routing_table:
-                        old_next_hop = old_routing_table[dest_id].get('next_hop')
-                        old_cost = old_routing_table[dest_id].get('cost', 0)
-
-                        # Logar mudanças de next_hop
-                        if new_next_hop != old_next_hop:
-                            route_history[node_id][dest_id].append((current_time, new_next_hop, new_cost))
-                            cost_diff = new_cost - old_cost
-                            if abs(cost_diff) > 10.0:
-                                indicator = "↓" if cost_diff < 0 else "↑"
-                                print(f"[{node_id}] ROTA p/ {dest_id}: {old_next_hop}({old_cost:.0f}ms) → {new_next_hop}({new_cost:.0f}ms) [{indicator}{abs(cost_diff):.0f}ms]")
-                        # Logar grandes mudanças de custo na mesma rota
-                        elif abs(new_cost - old_cost) > 15.0:
-                            route_history[node_id][dest_id].append((current_time, new_next_hop, new_cost))
-                            cost_diff = new_cost - old_cost
-                            indicator = "↓" if cost_diff < 0 else "↑"
-                            print(f"[{node_id}] CUSTO p/ {dest_id}: {old_cost:.0f}ms → {new_cost:.0f}ms [{indicator}{abs(cost_diff):.0f}ms]")
-                    else:
-                        # Nova rota descoberta
-                        route_history[node_id][dest_id].append((current_time, new_next_hop, new_cost))
-
-                # Atualizar dados principais
+                
+                # Se o nó não existe (skipou TCP), cria entrada básica
+                if node_id not in node_state:
+                    node_state[node_id] = {'ip': addr[0], 'routing_table': {}, 'neighbors': {}, 'streams': []}
+                
+                # Atualiza Estado
                 node_state[node_id]['last_seen'] = current_time
-                node_state[node_id]['neighbors'] = new_neighbors
-                node_state[node_id]['routing_table'] = new_routing_table
+                node_state[node_id]['neighbors'] = update.get('neighbors', {})
+                node_state[node_id]['routing_table'] = update.get('routing_table', {})
                 node_state[node_id]['streams'] = update.get('streams', [])
+                
+                # Atualiza IP se mudou
+                if node_state[node_id]['ip'] != addr[0]:
+                    node_state[node_id]['ip'] = addr[0]
 
-        except Exception:
-            time.sleep(0.1)
-
+        except Exception as e:
+            # print(f"[ERRO UDP] {e}")
+            pass
 
 def display_monitor():
-    """Thread que mostra tabelas de estado periodicamente."""
+    """Mostra o estado da rede e a árvore de multicast."""
     while True:
-        time.sleep(3)
+        time.sleep(2) # Refresh rate
 
         with state_lock:
             if not node_state:
                 continue
 
-            # Limpar tela (ANSI escape code)
+            # Limpar tela
             print("\033[2J\033[H", end="")
-
+            
             now = time.time()
-            print("=" * 120)
+            print("=" * 100)
             print(f"MONITORIZAÇÃO OVERLAY NETWORK - {datetime.now().strftime('%H:%M:%S')}")
-            print("=" * 120)
+            print("=" * 100)
 
-            # Tabela de nós ativos
-            print("\nNÓS ATIVOS:")
-            print(f"{'ID':<10} {'Estado':<7} {'Última Conexão':<16} {'Tempo':<8} {'Vizinhos Ativos':<40}")
-            for node_id in sorted(node_state.keys()):
-                info = node_state[node_id]
-                last_seen_seconds = now - info['last_seen']
-                status = "🟢 ALIVE" if last_seen_seconds < 10 else ("🟡 LOST" if last_seen_seconds < 30 else "🔴 DEAD")
-                last_conn = datetime.fromtimestamp(info['last_seen']).strftime('%H:%M:%S')
-                time_elapsed = f"{int(last_seen_seconds)}s" if last_seen_seconds < 60 else f"{int(last_seen_seconds/60)}m"
+            # 1. TABELA DE NÓS (removida coluna IP do nó; mostramos IPs dos vizinhos e custos)
+            print(f"{'ID':<12} {'STATUS':<8} {'VIZINHOS (IP:CUSTO)'}")
+            print("-" * 80)
+            
+            active_streamers = []
+            
+            for nid in sorted(node_state.keys()):
+                info = node_state[nid]
+                
+                # Verifica estado (Alive/Dead)
+                last_seen_sec = now - info['last_seen']
+                alive = last_seen_sec < 10
+                status = "🟢 ON" if alive else "🔴 OFF"
+                
+                # Formata vizinhos mostrando IPs e custos (arredondados)
                 neighbors = info.get('neighbors', {})
+                active_neighbors_str = []
 
-                active_neighbors = []
-                for neighbor_ip in neighbors.keys():
-                    # Verificar se este IP pertence a algum nó que está no node_state e está vivo
-                    for other_node_id, other_info in node_state.items():
-                        if other_info.get('ip') == neighbor_ip:
-                            other_last_seen = now - other_info['last_seen']
-                            if other_last_seen < 30:
-                                active_neighbors.append(other_node_id) # Mostrar ID em vez de IP
-                            break
+                for n_ip, data_val in neighbors.items():
+                    # Extrai custo
+                    cost = 0
+                    if isinstance(data_val, dict):
+                        cost = data_val.get('metric', 0)
+                    else:
+                        try:
+                            cost = float(data_val)
+                        except:
+                            cost = 0
 
-                neighbors_str = ', '.join(sorted(active_neighbors)) if active_neighbors else "-"
-                print(f"{node_id:<10} {status:<7} {last_conn:<16} {time_elapsed:<8} {neighbors_str:<40}")
+                    active_neighbors_str.append(f"{n_ip}({cost:.2f})")
 
-            # Tabela de rotas
-            print("\nTABELA DE ROTAS:")
-            print(f"{'Nó':<10} {'Destino':<12} {'Próx. Salto':<16} {'Custo':<8} {'Downstream':<10}")
-            for node_id in sorted(node_state.keys()):
-                routing_table = node_state[node_id].get('routing_table', {})
-                for dest_id, route_info in sorted(routing_table.items()):
-                    next_hop = route_info.get('next_hop', 'N/A')
-                    cost = route_info.get('cost', 0)
-                    downstream_count = len(route_info.get('downstream', []))
-                    print(f"{node_id:<10} {dest_id:<12} {next_hop:<16} {cost:>6.1f}ms {downstream_count:<10}")
+                neighbors_display = ", ".join(active_neighbors_str) if active_neighbors_str else "-"
+                # Não mostramos mais a coluna IP do nó; alinhamento: ID | STATUS | VIZINHOS
+                print(f"{nid:<12} {status:<8} {neighbors_display}")
+                
+                # Identifica Streamers ativos para desenhar a árvore depois
+                if "STREAMER" in nid and alive:
+                    active_streamers.append(nid)
 
-            # Streams activos
-            print("\n┌─── STREAMS ATIVOS " + "─" * 98 + "┐")
-            stream_info = defaultdict(list)
-            for node_id, info in node_state.items():
-                for stream in info.get('streams', []):
-                    stream_info[stream].append(node_id)
-
-            if stream_info:
-                for stream_id, nodes in stream_info.items():
-                    streamers = [n for n in nodes if 'STREAMER' in n]
-                    clients = [n for n in nodes if 'C' in n]
-                    routers = [n for n in nodes if n not in streamers and n not in clients]
-
-                    print(f"│ Stream: {stream_id:<30} Streamer: {','.join(streamers) if streamers else 'N/A':<20} Clients: {len(clients):<5} Routers: {len(routers):<5} │")
+            # 2. VISUALIZAÇÃO DA ÁRVORE
+            print("\n" + "="*100)
+            print(" ÁRVORE DE MULTICAST (Topology Visualizer)")
+            print("="*100)
+            
+            if not active_streamers:
+                print(" [!] Nenhum Streamer detetado ou ativo.")
             else:
-                print(f"│ {'Nenhum stream activo':<117} │")
+                for s_id in active_streamers:
+                    print(f"\n📺 Origem do Stream: {s_id}")
+                    # A árvore começa no Streamer (s_id) e segue o fluxo do stream (s_id)
+                    print_tree(s_id, s_id, "", True)
 
-            print("└" + "─" * 119 + "┘")
-            print("\n[Pressione Ctrl+C para parar o tracker]")
+            print("\n[Ctrl+C para sair]")
 
+# --- MAIN ---
 
 def start_tracker():
-    load_topology() # Inicializa o modo dinâmico
-
-    # Servidor TCP para bootstrap
+    load_topology()
+    
+    # Servidor TCP (Registo)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Permite reuso rápido do endereço
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         server.bind((BIND_IP, BIND_PORT))
-    except Exception:
-        print(f"[ERRO] Não foi possível bind em {BIND_IP}:{BIND_PORT}")
+    except Exception as e:
+        print(f"[FATAL] Erro bind TCP {BIND_PORT}: {e}")
         sys.exit(1)
     server.listen(5)
     print(f"[*] Bootstrapper TCP a correr em {BIND_IP}:{BIND_PORT}")
 
-    # Servidor UDP para monitorização
+    # Servidor UDP (Monitorização)
     monitor_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         monitor_sock.bind((BIND_IP, MONITOR_PORT))
-    except Exception:
-        print(f"[ERRO] Não foi possível bind UDP em {BIND_IP}:{MONITOR_PORT}")
+    except Exception as e:
+        print(f"[FATAL] Erro bind UDP {MONITOR_PORT}: {e}")
         sys.exit(1)
     print(f"[*] Monitor UDP a correr em {BIND_IP}:{MONITOR_PORT}")
 
-    # Iniciar threads
+    # Threads
     threading.Thread(target=handle_state_update, args=(monitor_sock,), daemon=True).start()
     threading.Thread(target=display_monitor, daemon=True).start()
 
-    print(f"[*] Sistema de monitorização activo. Aguardando registo e updates dos nós...")
-
+    # Loop Principal (Aceitar conexões TCP)
     while True:
         try:
             client, addr = server.accept()
             threading.Thread(target=handle_client, args=(client, addr), daemon=True).start()
         except KeyboardInterrupt:
-            # Captura no loop principal
             raise
-
+        except Exception as e:
+            print(f"[ERRO ACCEPT] {e}")
 
 if __name__ == "__main__":
     try:
         start_tracker()
     except KeyboardInterrupt:
-        print("\n\n[*] Tracker encerrado pelo utilizador.")
+        print("\n\n[*] Tracker encerrado.")
         sys.exit(0)

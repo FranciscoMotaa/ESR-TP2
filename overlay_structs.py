@@ -13,14 +13,14 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 class MsgType(Enum):
     HELLO = 1            
     ROUTE_DISCOVERY = 2  # Flood (LSA)
-    ROUTE_REPLY = 3      # Reservado
-    STREAM_JOIN = 4      # Cliente pede stream
-    STREAM_DATA = 5      # Dados do video
+    ROUTE_REPLY = 3      
+    STREAM_JOIN = 4      
+    STREAM_DATA = 5      
     HELLO_RESPONSE = 6   # Para medir RTT (Pong)
-    STREAM_LEAVE = 7     # Para parar o stream
-    STREAM_FEC = 8       # Pacote de Correção de Erro (Paridade)
+    STREAM_LEAVE = 7     
+    STREAM_FEC = 8       
     STREAM_REPORT = 9    # Relatório de Qualidade (Feedback do Cliente)
-    ACK_JOIN = 10        # Confirmação de JOIN para fiabilidade
+    ACK_JOIN = 10        
     DEBUG = 99
 
 @dataclass
@@ -37,10 +37,16 @@ class OverlayNode:
         self.ip = ip
         self.port = port
         self.sequence_number = 0
-        self.neighbors: Dict[str, Dict] = {}
+        # Incluímos 'loss_rate' no dict de vizinhos, default 0.0
+        self.neighbors: Dict[str, Dict] = {} 
         self.routing_table: Dict[str, RouteEntry] = {}
-        self.lsa_database: Dict[tuple, float] = {}
+        # lsa_database armazena (stream_id, origin_seq) para evitar loops
+        self.lsa_database: Dict[tuple, float] = {} 
         self.pending_pings: Dict[int, float] = {}
+        
+        # Parâmetros de Roteamento
+        self.LOSS_WEIGHT = 50.0  # 1% Loss = 50ms Latency Penalty
+        self.CHANGE_THRESHOLD = 0.05 # Histerese de 5%
 
     def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"") -> bytes:
         self.sequence_number += 1
@@ -67,7 +73,6 @@ class OverlayNode:
 
     def handle_hello(self, header, sender_ip):
         now = time.time()
-        # Modo Estrito: Só responder se for vizinho conhecido
         if sender_ip in self.neighbors:
             self.neighbors[sender_ip]['last_seen'] = now
             return json.dumps({"ack_seq": header['seq']}).encode('utf-8')
@@ -80,45 +85,36 @@ class OverlayNode:
             if ack_seq in self.pending_pings:
                 start_time = self.pending_pings.pop(ack_seq)
                 rtt_ms = (time.time() - start_time) * 1000.0 
-                old_metric = self.neighbors.get(sender_ip, {}).get('metric', rtt_ms)
-                new_metric = (0.7 * old_metric) + (0.3 * rtt_ms)
-                self.neighbors[sender_ip]['metric'] = new_metric
+                
+                # Inicializa ou atualiza métrica de vizinho
+                if sender_ip not in self.neighbors:
+                    self.neighbors[sender_ip] = {'metric': rtt_ms, 'last_seen': time.time(), 'loss_rate': 0.0}
+                else:
+                    old_metric = self.neighbors[sender_ip].get('metric', rtt_ms)
+                    new_metric = (0.7 * old_metric) + (0.3 * rtt_ms) # Moving Average
+                    self.neighbors[sender_ip]['metric'] = new_metric
+                    self.neighbors[sender_ip]['last_seen'] = time.time()
         except: pass
 
-    '''def handle_flood(self, header, payload, sender_ip_real):
-        try:
-            data = json.loads(payload.decode('utf-8'))
-            stream_id = data['stream_id']
-            custo_recebido = data['cost']
-            origin_seq = data['origin_seq']
-        except: return None
-
-        # Modo Estrito: Ignorar flood de desconhecidos
-        if sender_ip_real not in self.neighbors: return None
-
-        lsa_key = (stream_id, origin_seq)
-        if lsa_key in self.lsa_database: return None
-        self.lsa_database[lsa_key] = time.time()
-
-        metric_link = self.neighbors[sender_ip_real]['metric']
-        novo_custo = custo_recebido + metric_link
-
-        melhorou = False
-        if stream_id not in self.routing_table:
-            self.routing_table[stream_id] = RouteEntry(stream_id, sender_ip_real, novo_custo)
-            melhorou = True
-        else:
-            rota = self.routing_table[stream_id]
-            if novo_custo < rota.custo_acumulado:
-                rota.proximo_salto_ip = sender_ip_real
-                rota.custo_acumulado = novo_custo
-                melhorou = True
-
-        if melhorou:
-            data['cost'] = novo_custo
-            return json.dumps(data).encode('utf-8')
-        return None '''
-
+    # Incluímos o método de limpeza para robustez
+    def cleanup_neighbors(self, expiry_time):
+        """Remove vizinhos que não respondem ao HELLO."""
+        now = time.time()
+        to_remove = []
+        for n_ip, info in list(self.neighbors.items()):
+            if now - info.get('last_seen', 0) > expiry_time:
+                print(f"[⚠️] Vizinho {n_ip} expirado, a remover.")
+                to_remove.append(n_ip)
+        
+        for n_ip in to_remove:
+            del self.neighbors[n_ip]
+            # O Flood irá garantir o re-roteamento, mas limpamos a rota se o next_hop falhar
+            for sid, entry in list(self.routing_table.items()):
+                if entry.proximo_salto_ip == n_ip:
+                    print(f"[⚠️] Rota para {sid} via {n_ip} inválida. Limpeza.")
+                    del self.routing_table[sid] # Força re-descoberta no próximo Flood
+    
+    # --- MÉTODO CRÍTICO: ROTEAMENTO COM PERDA E HISTERESE ---
     def handle_flood(self, header, payload, sender_ip_real):
         try:
             data = json.loads(payload.decode('utf-8'))
@@ -127,69 +123,118 @@ class OverlayNode:
             origin_seq = data['origin_seq']
         except: return None
 
-        # Modo Estrito: Ignorar flood de desconhecidos
         if sender_ip_real not in self.neighbors: return None
 
-        # Verificar duplicados (Loop prevention)
         lsa_key = (stream_id, origin_seq)
         if lsa_key in self.lsa_database: return None
         self.lsa_database[lsa_key] = time.time()
 
-        metric_link = self.neighbors[sender_ip_real]['metric']
-        novo_custo = custo_recebido + metric_link
-
-        # --- AQUI COMEÇA A MUDANÇA CRÍTICA ---
+        # 1. CÁLCULO DA MÉTRICA DE LIGAÇÃO (Latência + Perda Ponderada)
+        metric_link = self.neighbors[sender_ip_real].get('metric', 1000)
+        # Buscar a taxa de perda (se o vizinho for downstream e tiver reportado)
+        link_loss = self.neighbors[sender_ip_real].get('loss_rate', 0.0) 
+        
+        # Ponderação: 1% de perda = 50ms de latência. 
+        # Custo do link = Latência + Penalização por Perda
+        custo_do_link = metric_link + (link_loss * self.LOSS_WEIGHT) 
+        
+        novo_custo = custo_recebido + custo_do_link 
+        
+        # --- LÓGICA DE ROTAS COM HISTERESE ---
         should_propagate = False
-        CHANGE_THRESHOLD = 0.05 # 5% de Histerese (reduzido para aceitar mais caminhos)
-
+        
+        current_cost = -1.0
+        old_next_hop = "N/A"
+        
         if stream_id not in self.routing_table:
             # Rota nova: Aceitar sempre
             self.routing_table[stream_id] = RouteEntry(stream_id, sender_ip_real, novo_custo)
+            print(f"[{self.node_id}] ➕ ROTA NOVA para {stream_id}. Próximo Salto: {sender_ip_real} (Custo: {novo_custo:.2f})")
             should_propagate = True
         else:
             rota = self.routing_table[stream_id]
-            
-            # CASO 1: Encontrámos um caminho MELHOR (mesmo que ligeiramente)
-            # Aceitar se for melhor, considerando threshold para evitar oscilação
-            if novo_custo < rota.custo_acumulado * (1 - CHANGE_THRESHOLD):
-                print(f"[{self.node_id}] 🔄 Caminho MELHOR para {stream_id}: {sender_ip_real} (custo {novo_custo:.2f} < {rota.custo_acumulado:.2f})")
+            current_cost = rota.custo_acumulado
+            old_next_hop = rota.proximo_salto_ip
+
+            # CASO 1: Encontrámos um caminho SIGNIFICATIVAMENTE MELHOR (HANDOVER)
+            if novo_custo < current_cost * (1 - self.CHANGE_THRESHOLD):
+                
+                # --- LOGGING CLARO DE MUDANÇA DE ROTA (HANDOVER) ---
+                print(f"[{self.node_id}] 🔄 HANDOVER para {stream_id}!")
+                print("--- Tabela de Rotas Atualizada ---")
+                print("| ROTA | CAMINHO ANTIGO | CUSTO ANTIGO | CAMINHO NOVO | CUSTO NOVO |")
+                print("| :--- | :------------- | :----------- | :----------- | :--------- |")
+                print(f"| {stream_id:<4} | {old_next_hop:<14} | {current_cost:<12.2f} | {sender_ip_real:<12} | {novo_custo:<10.2f} |")
+                print("-----------------------------------")
+                
                 rota.proximo_salto_ip = sender_ip_real
                 rota.custo_acumulado = novo_custo
                 should_propagate = True
             
-            # CASO 2: O caminho ATUAL piorou (Upper bound / Congestionamento)
-            # Se o meu fornecedor atual diz que o custo subiu, aceitar
-            elif sender_ip_real == rota.proximo_salto_ip:
-                if novo_custo > rota.custo_acumulado * (1 + CHANGE_THRESHOLD):
-                     print(f"[{self.node_id}] ⚠️  Caminho PIOROU para {stream_id}: custo {novo_custo:.2f} > {rota.custo_acumulado:.2f}")
-                     rota.custo_acumulado = novo_custo
-                     should_propagate = True
+            # CASO 2: O caminho ATUAL piorou
+            elif sender_ip_real == old_next_hop and novo_custo > current_cost * (1 + self.CHANGE_THRESHOLD):
+                 print(f"[{self.node_id}] ⚠️  Caminho atual PIOROU para {stream_id}: custo {novo_custo:.2f} (era {current_cost:.2f})")
+                 rota.custo_acumulado = novo_custo
+                 should_propagate = True
             
-            # CASO 3: Caminho alternativo competitivo (novo!)
-            # Aceitar caminhos alternativos que sejam razoavelmente bons
-            elif novo_custo <= rota.custo_acumulado * (1 + CHANGE_THRESHOLD * 2):
-                print(f"[{self.node_id}] 🔀 Caminho ALTERNATIVO para {stream_id}: {sender_ip_real} (custo {novo_custo:.2f} vs atual {rota.custo_acumulado:.2f})")
-                # Não mudamos a rota principal, mas propagamos para dar visibilidade
+            # CASO 3: Caminho alternativo que é competitivo (Propagar)
+            elif novo_custo <= current_cost * (1 + self.CHANGE_THRESHOLD * 2):
                 should_propagate = True
 
         if should_propagate:
             data['cost'] = novo_custo
-            # Pequeno Jitter para evitar "Broadcast Storms" síncronas
             time.sleep(0.005) 
             return json.dumps(data).encode('utf-8')
             
         return None
     
+    # --- NOVO MÉTODO: DIAGNÓSTICO DA ÁRVORE ---
+    def diagnose_multicast_tree(self) -> str:
+        """
+        Retorna uma representação da sub-árvore de multicast que este nó serve.
+        """
+        output = [f"--- Árvore de Multicast ({self.node_id}) ---"]
+        
+        streams_servidos = [sid for sid, entry in self.routing_table.items() 
+                            if len(entry.downstream_ips) > 0 or sid == self.node_id]
+        
+        if not streams_servidos:
+            output.append("Nenhum stream ativo ou a ser servido.")
+            return "\n".join(output)
+
+        for sid in streams_servidos:
+            entry = self.routing_table[sid]
+            
+            # Raiz da Sub-Árvore
+            role = "SOURCE" if sid == self.node_id else "ROUTER/CACHE"
+            upstream_info = f"via {entry.proximo_salto_ip} (Custo: {entry.custo_acumulado:.2f})" if sid != self.node_id else "(Origem)"
+            output.append(f"\n[{sid}] ({role}) {upstream_info}")
+            
+            if entry.downstream_ips:
+                output.append("  Clientes Downstream:")
+                for i, client_ip in enumerate(sorted(entry.downstream_ips)):
+                    # Adiciona a métrica do link (RTT + Penalização de Perda)
+                    link_info = self.neighbors.get(client_ip, {})
+                    rtt = link_info.get('metric', 'N/A')
+                    loss = link_info.get('loss_rate', 'N/A')
+                    
+                    link_str = f"Link: {rtt:.1f}ms RTT / {loss:.1f}% Loss" if isinstance(rtt, float) else "Link: N/A"
+                    
+                    prefixo = "└── " if i == len(entry.downstream_ips) - 1 else "├── "
+                    output.append(f"  {prefixo}{client_ip} ({link_str})")
+            else:
+                output.append("  Nenhum cliente Downstream direto.")
+                
+        return "\n".join(output)
+        
+    # --- LÓGICA DA ÁRVORE DE MULTICAST (JOIN/LEAVE) ---
+
     def handle_join(self, payload, sender_ip_real):
-        """
-        Retorna: (upstream_ip, send_ack)
-        """
         try:
             data = json.loads(payload.decode('utf-8'))
             target_stream = data['stream_id']
         except: return None, False
 
-        # Se sou Streamer
         if self.node_id == target_stream:
             if target_stream not in self.routing_table:
                 self.routing_table[target_stream] = RouteEntry(target_stream, "SELF", 0.0)
@@ -197,15 +242,14 @@ class OverlayNode:
             if sender_ip_real not in entry.downstream_ips:
                 entry.downstream_ips.add(sender_ip_real)
                 print(f"[{self.node_id}] 🎬 NOVO CLIENTE: {sender_ip_real}")
-            return "SOURCE", True # True = Enviar ACK
+            return "SOURCE", True 
 
-        # Se sou Router
         if target_stream in self.routing_table:
             entry = self.routing_table[target_stream]
             if sender_ip_real not in entry.downstream_ips:
                 entry.downstream_ips.add(sender_ip_real)
                 print(f"[{self.node_id}] 🔌 Cliente adicionado: {sender_ip_real}")
-            return entry.proximo_salto_ip, True # True = Enviar ACK
+            return entry.proximo_salto_ip, True 
         
         return None, False
 
@@ -234,8 +278,12 @@ class OverlayNode:
             client_id = data.get('client_id', 'unknown')
         except: return None
 
+        # CRÍTICO: Armazenar a perda do link com o vizinho DOWNSTREAM
+        if sender_ip_real in self.neighbors:
+            self.neighbors[sender_ip_real]['loss_rate'] = packet_loss 
+            print(f"[{self.node_id}] [QoS] Perda de {sender_ip_real}: {packet_loss:.1f}%")
+
         if self.node_id == target_stream:
-            print(f"[{self.node_id}] 📊 Relatório {client_id}: Perda {packet_loss:.1f}%")
             return "SOURCE"
         
         if target_stream in self.routing_table:

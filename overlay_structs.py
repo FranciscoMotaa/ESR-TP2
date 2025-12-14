@@ -30,6 +30,7 @@ class RouteEntry:
     custo_acumulado: float  
     downstream_ips: Set[str] = field(default_factory=set)
     last_update: float = 0.0
+    path: List[str] = field(default_factory=list)  # Hop-by-hop path towards source (first hop = next-hop)
 
 class OverlayNode:
     def __init__(self, node_id, ip, port):
@@ -47,6 +48,9 @@ class OverlayNode:
         # Parâmetros de Roteamento
         self.LOSS_WEIGHT = 50.0  # 1% Loss = 50ms Latency Penalty
         self.CHANGE_THRESHOLD = 0.05 # Histerese de 5%
+        # Registro compacto de mudanças de rota (para exibição em tabela)
+        self.route_changes: List[Dict] = []
+        self.MAX_ROUTE_CHANGES = 20
 
     def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"") -> bytes:
         self.sequence_number += 1
@@ -101,6 +105,7 @@ class OverlayNode:
         """Remove vizinhos que não respondem ao HELLO."""
         now = time.time()
         to_remove = []
+        removed_streams = []
         for n_ip, info in list(self.neighbors.items()):
             if now - info.get('last_seen', 0) > expiry_time:
                 print(f"[⚠️] Vizinho {n_ip} expirado, a remover.")
@@ -113,6 +118,10 @@ class OverlayNode:
                 if entry.proximo_salto_ip == n_ip:
                     print(f"[⚠️] Rota para {sid} via {n_ip} inválida. Limpeza.")
                     del self.routing_table[sid] # Força re-descoberta no próximo Flood
+                    removed_streams.append(sid)
+
+        # Retornar lista de streams cujas rotas foram removidas (para permitir ação imediata)
+        return removed_streams
     
     # --- MÉTODO CRÍTICO: ROTEAMENTO COM PERDA E HISTERESE ---
     def handle_flood(self, header, payload, sender_ip_real):
@@ -121,6 +130,7 @@ class OverlayNode:
             stream_id = data['stream_id']
             custo_recebido = data['cost']
             origin_seq = data['origin_seq']
+            origin_path = data.get('origin_path', [])
         except: return None
 
         if sender_ip_real not in self.neighbors: return None
@@ -139,6 +149,8 @@ class OverlayNode:
         custo_do_link = metric_link + (link_loss * self.LOSS_WEIGHT) 
         
         novo_custo = custo_recebido + custo_do_link 
+        # Construir o caminho hop-a-hop: o primeiro hop para este nó é quem enviou o flood
+        novo_path = [sender_ip_real] + origin_path if origin_path else [sender_ip_real]
         
         # --- LÓGICA DE ROTAS COM HISTERESE ---
         should_propagate = False
@@ -149,7 +161,9 @@ class OverlayNode:
         if stream_id not in self.routing_table:
             # Rota nova: Aceitar sempre
             self.routing_table[stream_id] = RouteEntry(stream_id, sender_ip_real, novo_custo)
-            print(f"[{self.node_id}] ➕ ROTA NOVA para {stream_id}. Próximo Salto: {sender_ip_real} (Custo: {novo_custo:.2f})")
+            self.routing_table[stream_id].path = novo_path
+            # Registar mudança de forma compacta
+            self._log_route_change('NEW', stream_id, None, sender_ip_real, None, novo_custo)
             should_propagate = True
         else:
             rota = self.routing_table[stream_id]
@@ -158,27 +172,25 @@ class OverlayNode:
 
             # CASO 1: Encontrámos um caminho SIGNIFICATIVAMENTE MELHOR (HANDOVER)
             if novo_custo < current_cost * (1 - self.CHANGE_THRESHOLD):
-                
-                # --- LOGGING CLARO DE MUDANÇA DE ROTA (HANDOVER) ---
-                print(f"[{self.node_id}] 🔄 HANDOVER para {stream_id}!")
-                print("--- Tabela de Rotas Atualizada ---")
-                print("| ROTA | CAMINHO ANTIGO | CUSTO ANTIGO | CAMINHO NOVO | CUSTO NOVO |")
-                print("| :--- | :------------- | :----------- | :----------- | :--------- |")
-                print(f"| {stream_id:<4} | {old_next_hop:<14} | {current_cost:<12.2f} | {sender_ip_real:<12} | {novo_custo:<10.2f} |")
-                print("-----------------------------------")
-                
+                # HANDOVER: caminho melhor
+                self._log_route_change('HANDOVER', stream_id, old_next_hop, sender_ip_real, current_cost, novo_custo)
                 rota.proximo_salto_ip = sender_ip_real
                 rota.custo_acumulado = novo_custo
+                rota.path = novo_path
                 should_propagate = True
             
             # CASO 2: O caminho ATUAL piorou
             elif sender_ip_real == old_next_hop and novo_custo > current_cost * (1 + self.CHANGE_THRESHOLD):
-                 print(f"[{self.node_id}] ⚠️  Caminho atual PIOROU para {stream_id}: custo {novo_custo:.2f} (era {current_cost:.2f})")
-                 rota.custo_acumulado = novo_custo
-                 should_propagate = True
+                self._log_route_change('WORSE', stream_id, old_next_hop, old_next_hop, current_cost, novo_custo)
+                rota.custo_acumulado = novo_custo
+                rota.path = novo_path
+                should_propagate = True
             
             # CASO 3: Caminho alternativo que é competitivo (Propagar)
             elif novo_custo <= current_cost * (1 + self.CHANGE_THRESHOLD * 2):
+                # Caminho alternativo competitivo — apenas registar para observação
+                self._log_route_change('ALT', stream_id, old_next_hop, sender_ip_real, current_cost, novo_custo)
+                rota.path = novo_path
                 should_propagate = True
 
         if should_propagate:
@@ -187,6 +199,25 @@ class OverlayNode:
             return json.dumps(data).encode('utf-8')
             
         return None
+
+    def _log_route_change(self, change_type, stream_id, old_next_hop, new_next_hop, old_cost, new_cost):
+        """Regista uma mudança de rota de forma compacta para exibição.
+
+        change_type: 'NEW'|'HANDOVER'|'WORSE'|'ALT'
+        """
+        entry = {
+            'ts': time.time(),
+            'type': change_type,
+            'stream': stream_id,
+            'old_nh': old_next_hop,
+            'new_nh': new_next_hop,
+            'old_cost': None if old_cost is None else float(old_cost),
+            'new_cost': None if new_cost is None else float(new_cost)
+        }
+        self.route_changes.append(entry)
+        # Limitar tamanho
+        if len(self.route_changes) > self.MAX_ROUTE_CHANGES:
+            self.route_changes.pop(0)
     
     # --- NOVO MÉTODO: DIAGNÓSTICO DA ÁRVORE ---
     def diagnose_multicast_tree(self) -> str:

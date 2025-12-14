@@ -160,6 +160,8 @@ def main():
     last_report = 0
     last_monitor_update = 0
     last_cleanup = 0
+    last_route_print = 0
+    ROUTE_TABLE_INTERVAL = 2.0
 
     inputs = [sock, sys.stdin]
     frame_seq = 0
@@ -201,8 +203,20 @@ def main():
             
             # --- 2.5 CLEANUP ---
             if now - last_cleanup >= CLEANUP_EXPIRY_TIME / 2: # Checkar mais rápido do que expira
-                 node.cleanup_neighbors(CLEANUP_EXPIRY_TIME)
+                 removed = node.cleanup_neighbors(CLEANUP_EXPIRY_TIME)
                  last_cleanup = now
+                 # Se removemos rotas por causa de falha de vizinho, forçar um flood imediato
+                 if removed:
+                     try:
+                         for sid in removed:
+                             flood_time = time.time()
+                             custo_inicial = 0 if sid == args.node_id else 0
+                             flood_payload = json.dumps({"stream_id": sid, "cost": custo_inicial, "origin_seq": int(flood_time), "origin_path": [node.ip]}).encode('utf-8')
+                             for n_ip in node.neighbors:
+                                 pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload)
+                                 sock.sendto(pkt, (n_ip, DEFAULT_PORT))
+                     except Exception:
+                         pass
 
             # --- 3. FLOOD ---
             if now - last_flood >= FLOOD_INTERVAL:
@@ -214,7 +228,7 @@ def main():
                     custo_inicial = 0 if sid == args.node_id else node.routing_table[sid].custo_acumulado
                     
                     flood_payload = json.dumps({
-                        "stream_id": sid, "cost": custo_inicial, "origin_seq": int(now)
+                        "stream_id": sid, "cost": custo_inicial, "origin_seq": int(now), "origin_path": [node.ip]
                     }).encode('utf-8')
                     
                     for n_ip in node.neighbors:
@@ -235,7 +249,8 @@ def main():
                         routing_data[sid] = {
                             'next_hop': entry.proximo_salto_ip,
                             'cost': entry.custo_acumulado,
-                            'downstream': list(entry.downstream_ips) 
+                            'downstream': list(entry.downstream_ips),
+                            'path': getattr(entry, 'path', [])
                         }
                     
                     state_update = json.dumps({
@@ -249,6 +264,41 @@ def main():
                     sock.sendto(state_update, (args.tracker, MONITOR_PORT))
                     last_monitor_update = now
                 except Exception: pass
+
+            # --- 3.6 DISPLAY COMPACTO DE MUDANÇAS DE ROTA ---
+            if now - last_route_print >= ROUTE_TABLE_INTERVAL:
+                try:
+                    # Limpar e mostrar tabela compacta
+                    print("\033[H\033[J", end="")
+                    print(f"--- {args.node_id} - Rota / Vizinhos (Atualizado {time.strftime('%H:%M:%S')}) ---")
+                    # Neighbors
+                    print("Neighbors:")
+                    for k,v in node.neighbors.items():
+                        print(f" - {k}: {v.get('metric',0):.1f}ms, loss {v.get('loss_rate',0):.1f}%")
+                    # Routing table
+                    print("\nRoutes:")
+                    for sid, entry in node.routing_table.items():
+                        nh = entry.proximo_salto_ip
+                        cost = entry.custo_acumulado
+                        downs = ",".join(sorted(list(entry.downstream_ips))) if entry.downstream_ips else "-"
+                        path = ",".join(entry.path) if getattr(entry, 'path', None) else "-"
+                        print(f" - {sid}: next {nh}, cost {cost:.1f}, path [{path}], down [{downs}]")
+                    # Recent route changes (compact)
+                    print("\nRecent route changes:")
+                    for rc in node.route_changes[-10:]:
+                        t = time.strftime('%H:%M:%S', time.localtime(rc['ts']))
+                        typ = rc['type']
+                        stream = rc['stream']
+                        old = rc.get('old_nh') or '-' 
+                        new = rc.get('new_nh') or '-'
+                        oc = rc.get('old_cost')
+                        nc = rc.get('new_cost')
+                        cost_str = f"{oc:.1f}->{nc:.1f}" if oc is not None and nc is not None else (f"->{nc:.1f}" if nc is not None else "")
+                        print(f" {t} | {typ:<8} | {stream:<10} | {old:<15} -> {new:<15} | {cost_str}")
+                    print('\n')
+                    last_route_print = now
+                except Exception:
+                    pass
 
             # --- 4. QoS REPORTS ---
             if "C" in args.node_id and now - last_report >= 2.0:

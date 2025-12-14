@@ -122,7 +122,15 @@ def handle_client(client_sock, addr):
         with state_lock:
             # Enviar IPs de todos os nós conhecidos como vizinhos potenciais
             all_active_ips = [info['ip'] for n_id, info in node_state.items() if n_id != node_id]
-            response_neighbors = all_active_ips
+            # Evitar devolver IPs de STREAMER diretamente a clientes
+            is_client = isinstance(node_id, str) and node_id.startswith('C')
+            filtered = []
+            for ip in all_active_ips:
+                nid = find_node_id_by_ip(ip)
+                if is_client and isinstance(nid, str) and 'STREAMER' in nid:
+                    continue
+                filtered.append(ip)
+            response_neighbors = filtered
 
             if node_id not in node_state:
                 node_state[node_id] = {

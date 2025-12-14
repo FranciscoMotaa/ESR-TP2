@@ -24,7 +24,7 @@ HELLO_INTERVAL = 0.5
 FLOOD_INTERVAL = 2.0 
 JOIN_TIMEOUT = 5.0
 MONITOR_UPDATE_INTERVAL = 1.0
-CLEANUP_EXPIRY_TIME = 3 * HELLO_INTERVAL + 1.0 # Expirar após 3.5s
+CLEANUP_EXPIRY_TIME = max(10.0, 3 * HELLO_INTERVAL + 1.0)  # Expirar após pelo menos 10s para reduzir remoções prematuras
 
 # --- FUNÇÃO CRÍTICA PARA A ÁRVORE ---
 def get_all_ips():
@@ -189,6 +189,11 @@ def main():
             # --- 2. HELLOS ---
             if now - last_hello >= HELLO_INTERVAL:
                 for n_ip in node.neighbors:
+                    # Atualiza last_seen quando enviamos HELLO para evitar remoções imediatas
+                    try:
+                        node.neighbors[n_ip]['last_seen'] = time.time()
+                    except Exception:
+                        pass
                     pkt = node.pack_message(MsgType.HELLO, n_ip, b"")
                     node.pending_pings[node.sequence_number] = now
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))

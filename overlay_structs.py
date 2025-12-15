@@ -175,89 +175,49 @@ class OverlayNode:
             origin_seq = data['origin_seq']
         except: return None
 
-        # 1. Validação de Vizinho (Segurança)
-        if sender_ip_real not in self.neighbors:
-            # print(f"[{self.node_id}] ⚠️ FLOOD ignorado: {sender_ip_real} não é vizinho")
-            return None
+        if sender_ip_real not in self.neighbors: return None
         
-        # 2. Loop Prevention (LSA Database)
         lsa_key = (stream_id, origin_seq)
-        
-        # Se já processámos este flood específico...
         if lsa_key in self.lsa_database:
-            # Se já temos rota, é um duplicado/loop -> Ignorar
-            if stream_id in self.routing_table:
-                return None
-            # Se NÃO temos rota (ex: crashou e voltou), aceitamos mesmo sendo duplicado
+            if stream_id in self.routing_table: return None
         
         self.lsa_database[lsa_key] = time.time()
-
-        # 3. Cálculo do Novo Custo
         metric_link = self.neighbors[sender_ip_real]['metric']
         novo_custo = custo_recebido + metric_link
 
-        # --- LÓGICA DE ESTABILIZAÇÃO (HISTERESE) ---
         should_propagate = False
         route_changed = False
-        
-        # LIMIAR DE ESTABILIDADE: 0.15 = 15%
-        # Só inundamos a rede se a mudança for superior a 15%
         CHANGE_THRESHOLD = 0.15 
 
         if stream_id not in self.routing_table:
-            # Rota Nova: Aceitar sempre e propagar imediatamente
             self.routing_table[stream_id] = RouteEntry(stream_id, sender_ip_real, novo_custo)
             self.routing_table[stream_id].last_update = time.time()
             should_propagate = True
             route_changed = True
-            print(f"[{self.node_id}] 🆕 Nova rota para {stream_id}: via {sender_ip_real} (custo {novo_custo:.1f})")
         else:
             rota = self.routing_table[stream_id]
             old_cost = rota.custo_acumulado
             old_next_hop = rota.proximo_salto_ip
             
-            # Calcular a diferença percentual
             diff = abs(novo_custo - old_cost)
-            is_significant = False
-            if old_cost > 0:
-                is_significant = diff > (old_cost * CHANGE_THRESHOLD)
-            else:
-                is_significant = diff > 5.0 # Fallback se custo antigo for 0
+            is_significant = (diff > (old_cost * CHANGE_THRESHOLD)) if old_cost > 0 else True
 
-            # CASO A: Melhor Caminho por um VIZINHO DIFERENTE
-            # Só trocamos de vizinho se for claramente melhor (evita ping-pong)
-            if sender_ip_real != old_next_hop:
-                if novo_custo < (old_cost * 0.90): # Tem de ser 10% melhor para justificar a troca
-                    print(f"[{self.node_id}] 🔄 Rota MELHOR: via {sender_ip_real} ({novo_custo:.1f} < {old_cost:.1f})")
-                    rota.proximo_salto_ip = sender_ip_real
-                    rota.custo_acumulado = novo_custo
-                    rota.last_update = time.time()
-                    should_propagate = True
-                    route_changed = True
-
-            # CASO B: Atualização do VIZINHO ATUAL
-            elif sender_ip_real == old_next_hop:
-                # Atualizamos sempre o custo localmente para manter a precisão
+            # Só mudamos se for melhor
+            if novo_custo < (old_cost * 0.90): 
+                rota.proximo_salto_ip = sender_ip_real
                 rota.custo_acumulado = novo_custo
-                rota.last_update = time.time()
-                
-                # MAS só gritamos para a rede se a mudança for grande
-                if is_significant:
-                    # print(f"[{self.node_id}] ⚠️ Custo alterou sigificativamente: {old_cost:.1f} -> {novo_custo:.1f}")
-                    should_propagate = True
-                else:
-                    # Silêncio: A mudança é pequena (jitter), não vale a pena inundar
-                    should_propagate = False 
+                should_propagate = True
+                route_changed = True
+            elif sender_ip_real == old_next_hop:
+                rota.custo_acumulado = novo_custo
+                if is_significant: should_propagate = True
+            
+            # REMOVI O "PIOROU" - Se for pior, ignoramos silenciosamente para estabilizar o áudio.
 
-        # 4. Propagação (Flood)
         if should_propagate:
             data['cost'] = novo_custo
-            if route_changed:
-                data['route_changed'] = True
-            
-            # Serializa e envia
+            if route_changed: data['route_changed'] = True
             return json.dumps(data).encode('utf-8')
-            
         return None
     
     def handle_join(self, payload, sender_ip_real):
@@ -278,8 +238,8 @@ class OverlayNode:
             if sender_ip_real not in entry.downstream_ips:
                 entry.downstream_ips.add(sender_ip_real)
                 print(f"[{self.node_id}] 🎬 NOVO CLIENTE: {sender_ip_real} (total: {len(entry.downstream_ips)})")
-            else:
-                print(f"[{self.node_id}] ⚠️ Cliente já existe: {sender_ip_real}")
+            # else:
+                # print(f"[{self.node_id}] ⚠️ Cliente já existe: {sender_ip_real}")
             return "SOURCE", True # True = Enviar ACK
 
         # Se sou Router

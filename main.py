@@ -26,26 +26,27 @@ def get_all_ips():
         return [get_interface_ip()]
 
 class FFmpegStreamer:
-    def __init__(self, filename, quality='LOW'): # <--- FORÇAR 'LOW' COMO DEFAULT
+    def __init__(self, filename, quality='LOW'): # <--- MUDADO PARA LOW POR DEFEITO
         self.filename = filename
         self.current_quality = quality
         print(f"[STREAMER] A iniciar transcodificação ({quality})...")
         
-        # AJUSTE BRUTAL: Reduzir resolução e bitrate para garantir Áudio
+        # AJUSTE: Bitrates Ultra-Baixos para garantir Áudio na emulação
         if quality == 'HIGH':
-            scale = "640:480"; v_bitrate = "600k" # Reduzi de 800k para 600k
+            scale = "640:480"; v_bitrate = "500k"
         else: 
-            scale = "320:240"; v_bitrate = "150k" # Reduzi de 200k para 150k (Ultra leve)
+            # Modo 'Batata' para garantir que o áudio passa
+            scale = "320:240"; v_bitrate = "100k" 
 
         command = [
             'ffmpeg', '-re', '-stream_loop', '-1', '-i', filename,
             '-vf', f'scale={scale}', 
             '-f', 'mpegts', 
-            # Codec de Vídeo Leve
+            # Vídeo muito leve
             '-c:v', 'mpeg2video', '-b:v', v_bitrate, '-maxrate', v_bitrate, 
             '-bufsize', v_bitrate,
-            '-g', '24', # Keyframe a cada 24 frames (menos dados)
-            # Codec de Áudio (AAC é mais robusto que AC3 em bitrates baixos)
+            '-g', '30', # Menos keyframes para poupar dados
+            # Áudio AAC (Mais eficiente que AC3)
             '-c:a', 'aac', '-b:a', '64k', '-ac', '1', 
             '-ar', '44100', 
             '-'
@@ -127,7 +128,7 @@ def main():
 
     # 3. ARRANQUE RÁPIDO (Fast Convergence)
     # Agora que o socket existe, enviamos os pacotes imediatos para "acordar" a rede
-    print("[🚀] ARRANQUE RÁPIDO: A forçar entrada na rede...")
+    
 
     # A) Forçar HELLO aos vizinhos estáticos
     for n_ip in static_neighbors_list:

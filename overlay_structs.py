@@ -405,6 +405,7 @@ class OverlayNode:
         """
         now = time.time()
         dead_neighbors = []
+        updated_routes = []
 
         # thresholds
         dead_threshold = timeout
@@ -477,6 +478,8 @@ class OverlayNode:
                             self.routing_table[stream_id] = RouteEntry(stream_id, best_sender, best_cost)
                             self.routing_table[stream_id].last_update = time.time()
                             print(f"[{self.node_id}] 🔁 Rota para {stream_id} recalculada: via {best_sender} (custo {best_cost:.2f}, {priority_label})")
+                            # registrar rota atualizada para notificar a camada de rede (main) a enviar JOIN upstream
+                            updated_routes.append((stream_id, best_sender))
                             if len(candidates) > 1:
                                 print(f"[{self.node_id}]    └─ {len(candidates)-1} alternativa(s) disponível(eis)")
                         else:
@@ -499,7 +502,7 @@ class OverlayNode:
                     print(f"[{self.node_id}] 🧹 Removidas {lsas_deleted} LSAs do vizinho morto (mantendo alternativas)")
                     print(f"[{self.node_id}] 📊 LSAs restantes: {len(self.lsa_database)} (podem conter rotas alternativas)")
 
-        return dead_neighbors
+                return dead_neighbors, updated_routes
 
     def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"", encrypt: bool = True) -> bytes:
         """
@@ -727,10 +730,11 @@ class OverlayNode:
             if route_changed:
                 data['route_changed'] = True
             print(f"[{self.node_id}] ➡️ Propagando flood {stream_id} (custo {novo_custo:.2f})")
+            print(f"[{self.node_id}]    (flood recebido de {sender_ip_real}, origin_seq={origin_seq})")
             time.sleep(0.002)  # Pequeno jitter
             return json.dumps(data).encode('utf-8')
         else:
-            print(f"[{self.node_id}] 🚫 NÃO propagando {stream_id} (custo {novo_custo:.2f} não melhora {self.routing_table.get(stream_id, RouteEntry('', '', float('inf'))).custo_acumulado:.2f})")
+            print(f"[{self.node_id}] 🚫 NÃO propagando {stream_id} (flood de {sender_ip_real} custo {novo_custo:.2f} não melhora {self.routing_table.get(stream_id, RouteEntry('', '', float('inf'))).custo_acumulado:.2f})")
             
         return None
     
@@ -744,7 +748,11 @@ class OverlayNode:
         try:
             data = json.loads(payload.decode('utf-8'))
             target_stream = data['stream_id']
-        except: return None, False, False
+        except:
+            print(f"[{self.node_id}] [handle_join] payload inválido de {sender_ip_real}")
+            return None, False, False
+
+        print(f"[{self.node_id}] [handle_join] pedido de {sender_ip_real} para stream {target_stream}")
 
         # Se sou Streamer (SOURCE)
         if self.node_id == target_stream:
@@ -757,6 +765,7 @@ class OverlayNode:
                 entry.downstream_ips.add(sender_ip_real)
                 print(f"[{self.node_id}] >> NOVO CLIENTE: {sender_ip_real}")
             already_receiving = not was_first
+            print(f"[{self.node_id}] [handle_join] retorno: SOURCE, ack=True, already_receiving={already_receiving}")
             return "SOURCE", True, already_receiving # True = Enviar ACK
 
         # Se sou Router e JÁ tenho rota para este stream
@@ -767,6 +776,7 @@ class OverlayNode:
                 entry.downstream_ips.add(sender_ip_real)
                 print(f"[{self.node_id}] >> Cliente adicionado: {sender_ip_real}")
             already_receiving = not was_first
+            print(f"[{self.node_id}] [handle_join] retorno: up={entry.proximo_salto_ip}, ack=True, already_receiving={already_receiving}")
             return entry.proximo_salto_ip, True, already_receiving # True = Enviar ACK
         
         # Não tenho rota para este stream
@@ -778,6 +788,8 @@ class OverlayNode:
             target_stream = data['stream_id']
         except: return None
 
+        print(f"[{self.node_id}] [handle_leave] pedido de {sender_ip_real} para stream {target_stream}")
+
         if target_stream in self.routing_table:
             entry = self.routing_table[target_stream]
             if sender_ip_real in entry.downstream_ips:
@@ -786,6 +798,7 @@ class OverlayNode:
             
             if len(entry.downstream_ips) == 0 and self.node_id != target_stream:
                 print(f"[{self.node_id}] >> Sem clientes. Pedindo corte ao upstream.")
+                print(f"[{self.node_id}] [handle_leave] retorno: up={entry.proximo_salto_ip}")
                 return entry.proximo_salto_ip
         return None
 

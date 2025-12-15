@@ -266,7 +266,7 @@ def main():
                     if join_state['retries'] < 3: 
                         print(f"[TIMEOUT] Reenviando JOIN para {join_state['target_ip']}...")
                         pl = json.dumps({"stream_id": join_state['stream_id']}).encode('utf-8')
-                        pk = node.pack_message(MsgType.STREAM_JOIN, join_state['target_ip'], pl)
+                        pk = node.pack_message(MsgType.STREAM_JOIN, join_state['target_ip'], pl, encrypt=True)
                         sock.sendto(pk, (join_state['target_ip'], DEFAULT_PORT))
                         join_state['last_sent'] = now
                         join_state['retries'] += 1
@@ -277,7 +277,7 @@ def main():
             # --- 2. Hellos ---
             if now - last_hello >= HELLO_INTERVAL:
                 for n_ip in node.neighbors:
-                    pkt = node.pack_message(MsgType.HELLO, n_ip, b"")
+                    pkt = node.pack_message(MsgType.HELLO, n_ip, b"", encrypt=True)
                     node.pending_pings[node.sequence_number] = now
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
                 last_hello = now
@@ -290,7 +290,7 @@ def main():
                     "origin_seq": int(now)
                 }).encode('utf-8')
                 for n_ip in node.neighbors:
-                    pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload)
+                    pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, flood_payload, encrypt=True)
                     sock.sendto(pkt, (n_ip, DEFAULT_PORT))
                 last_flood = now
 
@@ -385,7 +385,7 @@ def main():
                          print(f"\n[CLIENTE-QoS] ENVIANDO Relatorio: Rede={network_loss_rate:.1f}% Final={final_loss_rate:.1f}% FEC={fec_recovered_count}")
                          print(f"[CLIENTE-QoS] Destino: {join_state['target_ip']} Stream: {join_state['stream_id']}")
                          
-                         pkt = node.pack_message(MsgType.STREAM_REPORT, join_state['target_ip'], report_payload)
+                         pkt = node.pack_message(MsgType.STREAM_REPORT, join_state['target_ip'], report_payload, encrypt=True)
                          sock.sendto(pkt, (join_state['target_ip'], DEFAULT_PORT))
                          
                          stats_frames_received = 0
@@ -526,7 +526,7 @@ def main():
                         # --- PROCESSAMENTO ---
                         if header['type'] == MsgType.HELLO:
                             resp = node.handle_hello(header, sender_ip_real)
-                            pkt = node.pack_message(MsgType.HELLO_RESPONSE, sender_ip_real, resp)
+                            pkt = node.pack_message(MsgType.HELLO_RESPONSE, sender_ip_real, resp, encrypt=True)
                             sock.sendto(pkt, (sender_ip_real, DEFAULT_PORT))
 
                         elif header['type'] == MsgType.HELLO_RESPONSE:
@@ -537,7 +537,7 @@ def main():
                             if new_payload:
                                 for n_ip in node.neighbors:
                                     if n_ip != sender_ip_real:
-                                        pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, new_payload)
+                                        pkt = node.pack_message(MsgType.ROUTE_DISCOVERY, n_ip, new_payload, encrypt=True)
                                         sock.sendto(pkt, (n_ip, DEFAULT_PORT))
 
                         elif header['type'] == MsgType.STREAM_JOIN:
@@ -547,7 +547,7 @@ def main():
                                     jdata = json.loads(payload.decode('utf-8'))
                                     sid = jdata['stream_id']
                                     ack_pl = json.dumps({"stream_id": sid}).encode('utf-8')
-                                    ack_pkt = node.pack_message(MsgType.ACK_JOIN, sender_ip_real, ack_pl)
+                                    ack_pkt = node.pack_message(MsgType.ACK_JOIN, sender_ip_real, ack_pl, encrypt=True)
                                     sock.sendto(ack_pkt, (sender_ip_real, DEFAULT_PORT))
                                 except: pass
 
@@ -561,7 +561,7 @@ def main():
                                         is_serving = True
                                 except: pass
                                 if not is_serving:
-                                    pkt = node.pack_message(MsgType.STREAM_JOIN, upstream_ip, payload)
+                                    pkt = node.pack_message(MsgType.STREAM_JOIN, upstream_ip, payload, encrypt=True)
                                     sock.sendto(pkt, (upstream_ip, DEFAULT_PORT))
 
                         elif header['type'] == MsgType.ACK_JOIN:
@@ -572,7 +572,7 @@ def main():
                         elif header['type'] == MsgType.STREAM_LEAVE:
                             upstream_prune = node.handle_leave(payload, sender_ip_real)
                             if upstream_prune and upstream_prune != "SOURCE":
-                                pkt = node.pack_message(MsgType.STREAM_LEAVE, upstream_prune, payload)
+                                pkt = node.pack_message(MsgType.STREAM_LEAVE, upstream_prune, payload, encrypt=True)
                                 sock.sendto(pkt, (upstream_prune, DEFAULT_PORT))
 
                         # --- ACK/NACK HANDLING ---
@@ -630,7 +630,7 @@ def main():
                                     # Sou router - encaminhar NACK upstream
                                     if stream_id in node.routing_table:
                                         upstream = node.routing_table[stream_id].proximo_salto_ip
-                                        nack_pkt = node.pack_message(MsgType.STREAM_NACK, upstream, payload)
+                                        nack_pkt = node.pack_message(MsgType.STREAM_NACK, upstream, payload, encrypt=True)
                                         sock.sendto(nack_pkt, (upstream, DEFAULT_PORT))
                             except Exception as e:
                                 print(f"Erro NACK: {e}")
@@ -640,7 +640,7 @@ def main():
                             # 1. Router: Encaminhar
                             upstream_report = node.handle_report(payload, sender_ip_real)
                             if upstream_report and upstream_report != "SOURCE":
-                                pkt = node.pack_message(MsgType.STREAM_REPORT, upstream_report, payload)
+                                pkt = node.pack_message(MsgType.STREAM_REPORT, upstream_report, payload, encrypt=True)
                                 sock.sendto(pkt, (upstream_report, DEFAULT_PORT))
                             
                             # 2. Streamer: Decidir Qualidade (ABR Inteligente)
@@ -730,7 +730,7 @@ def main():
                                 if s_id in node.routing_table:
                                     for child in node.routing_table[s_id].downstream_ips:
                                         if child != sender_ip_real:
-                                            pkt = node.pack_message(MsgType.STREAM_FEC, child, payload)
+                                            pkt = node.pack_message(MsgType.STREAM_FEC, child, payload, encrypt=True)
                                             sock.sendto(pkt, (child, DEFAULT_PORT))
                                 
                                 # Cliente: Armazenar FEC para possível recuperação (filtrar duplicatas)
@@ -764,7 +764,7 @@ def main():
                                     for child in node.routing_table[s_id].downstream_ips:
                                         if child != sender_ip_real:
                                             msg_type = MsgType.STREAM_RETX if header['type'] == MsgType.STREAM_RETX else MsgType.STREAM_DATA
-                                            pkt = node.pack_message(msg_type, child, payload)
+                                            pkt = node.pack_message(msg_type, child, payload, encrypt=True)
                                             sock.sendto(pkt, (child, DEFAULT_PORT))
                                 
                                 # Cliente: Play + Detecção de Perdas com FEC IMEDIATO
@@ -858,7 +858,7 @@ def main():
                                                     "missing_seqs": missing_seqs[:10],  # Máximo 10
                                                     "client_id": args.node_id
                                                 }).encode('utf-8')
-                                                nack_pkt = node.pack_message(MsgType.STREAM_NACK, join_state['target_ip'], nack_payload)
+                                                nack_pkt = node.pack_message(MsgType.STREAM_NACK, join_state['target_ip'], nack_payload, encrypt=True)
                                                 sock.sendto(nack_pkt, (join_state['target_ip'], DEFAULT_PORT))
                                                 last_nack_time = now
                                                 
@@ -923,7 +923,7 @@ def main():
                                             "packets_lost": stats_frames_lost,
                                             "fec_recovered": fec_recovered_count
                                         }).encode('utf-8')
-                                        ack_pkt = node.pack_message(MsgType.STREAM_ACK, join_state['target_ip'], ack_payload)
+                                        ack_pkt = node.pack_message(MsgType.STREAM_ACK, join_state['target_ip'], ack_payload, encrypt=True)
                                         sock.sendto(ack_pkt, (join_state['target_ip'], DEFAULT_PORT))
                                     
                                     if stats_frames_received % 100 == 0:
@@ -955,7 +955,7 @@ def main():
                             if target in node.routing_table:
                                 nh = node.routing_table[target].proximo_salto_ip
                                 pl = json.dumps({"stream_id": target}).encode('utf-8')
-                                pk = node.pack_message(MsgType.STREAM_JOIN, nh, pl)
+                                pk = node.pack_message(MsgType.STREAM_JOIN, nh, pl, encrypt=True)
                                 sock.sendto(pk, (nh, DEFAULT_PORT))
                                 join_state['active'] = True
                                 join_state['stream_id'] = target

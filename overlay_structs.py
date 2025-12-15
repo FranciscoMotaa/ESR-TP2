@@ -392,18 +392,18 @@ class OverlayNode:
         self.stats_encrypted_recv = 0
         self.stats_decrypt_failed = 0
 
-    def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"", encrypt: bool = False) -> bytes:
+    def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"", encrypt: bool = True) -> bytes:
         """
-        Cria pacote com header + payload (opcionalmente cifrado).
+        Cria pacote com header + payload (cifrado por padrão).
         
         Args:
             msg_type: Tipo de mensagem
             dest_ip: IP destino
             payload: Dados
-            encrypt: Se True, cifra payload com AES-GCM
+            encrypt: Se True, cifra payload com AES-GCM (padrão: True)
         
         Returns:
-            Pacote completo (header sempre claro, payload pode ser cifrado)
+            Pacote completo (header sempre claro, payload cifrado por padrão)
         """
         self.sequence_number += 1
         timestamp = time.time()

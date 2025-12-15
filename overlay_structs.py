@@ -175,90 +175,88 @@ class OverlayNode:
             origin_seq = data['origin_seq']
         except: return None
 
-        # Modo Estrito: Ignorar flood de desconhecidos
+        # 1. Validação de Vizinho (Segurança)
         if sender_ip_real not in self.neighbors:
-            print(f"[{self.node_id}] ⚠️ FLOOD ignorado: {sender_ip_real} não é vizinho")
+            # print(f"[{self.node_id}] ⚠️ FLOOD ignorado: {sender_ip_real} não é vizinho")
             return None
         
-        # Verificar se vizinho está respondendo aos HELLOs (verificação leve)
-        neighbor_info = self.neighbors[sender_ip_real]
-        time_since_seen = time.time() - neighbor_info.get('last_seen', 0)
-        # Aceitar floods mesmo de vizinhos que não respondem (broadcast),
-        # mas dar preferência a rotas de vizinhos ativos
-        if time_since_seen > 60.0:  # Muito tempo sem resposta (1 minuto)
-            # Silenciosamente ignorar (pode ser broadcast de nó distante)
-            return None
-
-        # Verificar duplicados (Loop prevention) - MAS permitir se não temos rota
+        # 2. Loop Prevention (LSA Database)
         lsa_key = (stream_id, origin_seq)
+        
+        # Se já processámos este flood específico...
         if lsa_key in self.lsa_database:
-            # Se já temos rota válida, ignorar duplicado
+            # Se já temos rota, é um duplicado/loop -> Ignorar
             if stream_id in self.routing_table:
                 return None
-            # Se não temos rota, aceitar mesmo que seja duplicado (recuperação)
-            print(f"[{self.node_id}] 🔓 Aceitando FLOOD duplicado (sem rota válida)")
-        self.lsa_database[lsa_key] = time.time()
+            # Se NÃO temos rota (ex: crashou e voltou), aceitamos mesmo sendo duplicado
         
-        # DEBUG: Confirmar recepção de flood novo
-        print(f"[{self.node_id}] 📡 Flood recebido: {stream_id} de {sender_ip_real} (custo={custo_recebido:.2f})")
+        self.lsa_database[lsa_key] = time.time()
 
+        # 3. Cálculo do Novo Custo
         metric_link = self.neighbors[sender_ip_real]['metric']
         novo_custo = custo_recebido + metric_link
 
-        # --- LÓGICA DE ROTEAMENTO DINÂMICO ---
+        # --- LÓGICA DE ESTABILIZAÇÃO (HISTERESE) ---
         should_propagate = False
         route_changed = False
+        
+        # LIMIAR DE ESTABILIDADE: 0.15 = 15%
+        # Só inundamos a rede se a mudança for superior a 15%
+        CHANGE_THRESHOLD = 0.15 
 
         if stream_id not in self.routing_table:
-            # Rota nova: Aceitar sempre
+            # Rota Nova: Aceitar sempre e propagar imediatamente
             self.routing_table[stream_id] = RouteEntry(stream_id, sender_ip_real, novo_custo)
             self.routing_table[stream_id].last_update = time.time()
             should_propagate = True
             route_changed = True
-            print(f"[{self.node_id}] 🆕 Nova rota para {stream_id}: via {sender_ip_real} (custo {novo_custo:.2f})")
+            print(f"[{self.node_id}] 🆕 Nova rota para {stream_id}: via {sender_ip_real} (custo {novo_custo:.1f})")
         else:
             rota = self.routing_table[stream_id]
-            old_next_hop = rota.proximo_salto_ip
             old_cost = rota.custo_acumulado
+            old_next_hop = rota.proximo_salto_ip
             
-            # CASO 1: Encontrámos um caminho SIGNIFICATIVAMENTE MELHOR
-            if novo_custo < old_cost * 0.90:  # 10% melhor
-                print(f"[{self.node_id}] 🔄 Caminho MELHOR para {stream_id}: {sender_ip_real} (custo {novo_custo:.2f} << {old_cost:.2f})")
-                rota.proximo_salto_ip = sender_ip_real
-                rota.custo_acumulado = novo_custo
-                rota.last_update = time.time()
-                should_propagate = True
-                route_changed = True
-            
-            # CASO 2: Atualização do caminho ATUAL (mesmo Next Hop)
-            elif sender_ip_real == old_next_hop:
-                # Sempre aceitar atualizações do next hop atual
-                if abs(novo_custo - old_cost) > 1.0:  # Mudança significativa
-                    if novo_custo > old_cost:
-                        print(f"[{self.node_id}] ⚠️ Caminho PIOROU para {stream_id}: custo {novo_custo:.2f} (era {old_cost:.2f})")
-                    else:
-                        print(f"[{self.node_id}] ✅ Caminho melhorou para {stream_id}: custo {novo_custo:.2f} (era {old_cost:.2f})")
-                rota.custo_acumulado = novo_custo
-                rota.last_update = time.time()
-                should_propagate = True
-                # Não marcamos route_changed porque o next_hop é o mesmo
-            
-            # CASO 3: Caminho alternativo bom (pode ser útil para failover)
-            elif novo_custo < old_cost * 1.20:  # Até 20% pior que o atual
-                # Não mudamos a rota, mas propagamos para dar visibilidade
-                print(f"[{self.node_id}] 🔀 Caminho ALTERNATIVO para {stream_id}: via {sender_ip_real} (custo {novo_custo:.2f} vs {old_cost:.2f})")
-                should_propagate = True
+            # Calcular a diferença percentual
+            diff = abs(novo_custo - old_cost)
+            is_significant = False
+            if old_cost > 0:
+                is_significant = diff > (old_cost * CHANGE_THRESHOLD)
+            else:
+                is_significant = diff > 5.0 # Fallback se custo antigo for 0
 
+            # CASO A: Melhor Caminho por um VIZINHO DIFERENTE
+            # Só trocamos de vizinho se for claramente melhor (evita ping-pong)
+            if sender_ip_real != old_next_hop:
+                if novo_custo < (old_cost * 0.90): # Tem de ser 10% melhor para justificar a troca
+                    print(f"[{self.node_id}] 🔄 Rota MELHOR: via {sender_ip_real} ({novo_custo:.1f} < {old_cost:.1f})")
+                    rota.proximo_salto_ip = sender_ip_real
+                    rota.custo_acumulado = novo_custo
+                    rota.last_update = time.time()
+                    should_propagate = True
+                    route_changed = True
+
+            # CASO B: Atualização do VIZINHO ATUAL
+            elif sender_ip_real == old_next_hop:
+                # Atualizamos sempre o custo localmente para manter a precisão
+                rota.custo_acumulado = novo_custo
+                rota.last_update = time.time()
+                
+                # MAS só gritamos para a rede se a mudança for grande
+                if is_significant:
+                    # print(f"[{self.node_id}] ⚠️ Custo alterou sigificativamente: {old_cost:.1f} -> {novo_custo:.1f}")
+                    should_propagate = True
+                else:
+                    # Silêncio: A mudança é pequena (jitter), não vale a pena inundar
+                    should_propagate = False 
+
+        # 4. Propagação (Flood)
         if should_propagate:
             data['cost'] = novo_custo
-            # Marca se houve mudança de next hop para downstream nodes saberem
             if route_changed:
                 data['route_changed'] = True
-            print(f"[{self.node_id}] ➡️ Propagando flood {stream_id} (custo {novo_custo:.2f})")
-            time.sleep(0.002)  # Pequeno jitter
+            
+            # Serializa e envia
             return json.dumps(data).encode('utf-8')
-        else:
-            print(f"[{self.node_id}] 🚫 NÃO propagando {stream_id} (custo {novo_custo:.2f} não melhora {self.routing_table.get(stream_id, RouteEntry('', '', float('inf'))).custo_acumulado:.2f})")
             
         return None
     
@@ -327,3 +325,16 @@ class OverlayNode:
             entry = self.routing_table[target_stream]
             return entry.proximo_salto_ip
         return None
+    
+    def check_active_routes_health(self):
+        """
+        Verifica se existem rotas alternativas melhores para os streams ativos.
+        Retorna uma lista de tuplos: (stream_id, old_next_hop, new_next_hop, new_cost)
+        """
+        switches = []
+        # Lógica simplificada:
+        # Iterar sobre as rotas ativas e verificar se algum vizinho oferece um custo
+        # significativamente menor (ex: > 20% melhor) do que o atual.
+        
+        # Para já, retornamos vazio para impedir o crash e deixar o FLOOD gerir as rotas.
+        return switches

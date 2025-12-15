@@ -14,8 +14,8 @@ MONITOR_PORT = 6001  # Porta UDP para receber updates de estado
 NODE_DEFAULT_PORT = 50000  # Porta que os nós usam para comunicação
 TOPOLOGY_FILE = "bootstrap_conf.json"
 # Thresholds para monitorização (segundos)
-MONITOR_LOST_THRESHOLD = 10
-MONITOR_DEAD_THRESHOLD = 30
+MONITOR_LOST_THRESHOLD = 5
+MONITOR_DEAD_THRESHOLD = 12
 
 # Estruturas de dados para monitorização
 node_state = {}

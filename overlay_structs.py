@@ -37,51 +37,120 @@ class OverlayNode:
         self.ip = ip
         self.port = port
         self.sequence_number = 0
+        # neighbors: ip -> { metric: float, last_seen: float, state: 'alive'|'lost'|'dead' }
         self.neighbors: Dict[str, Dict] = {}
         self.routing_table: Dict[str, RouteEntry] = {}
-        self.lsa_database: Dict[tuple, float] = {}
+        # lsa_database maps (stream_id, origin_seq) -> metadata dict
+        # metadata: { 'time': float, 'data': dict, 'sender': str, 'cost': float }
+        self.lsa_database: Dict[tuple, dict] = {}
         self.pending_pings: Dict[int, float] = {}
     
     def check_dead_neighbors(self, timeout=20.0):
-        """Verifica vizinhos mortos e remove rotas que dependem deles"""
+        """Verifica estado dos vizinhos e remove/retorna os mortos.
+
+        Comportamento:
+        - Se `time_since_seen` < timeout/2 => `alive`
+        - Se timeout/2 <= `time_since_seen` < timeout => `lost`
+        - Se `time_since_seen` >= timeout => `dead` (removido)
+
+        Retorna lista de vizinhos removidos (dead).
+        """
         now = time.time()
         dead_neighbors = []
-        dead_info = {}  # Para guardar info de debug
-        
+
+        # thresholds
+        dead_threshold = timeout
+        lost_threshold = timeout / 2.0
+
         for n_ip, info in list(self.neighbors.items()):
             last_seen = info.get('last_seen', 0)
-            
-            # Só verifica se já vimos este vizinho há algum tempo
-            if last_seen == 0 or last_seen == now:
-                continue  # Vizinho recém descoberto, dar tempo
-            
+            if last_seen == 0:
+                # recém descoberto
+                self.neighbors[n_ip]['state'] = 'alive'
+                continue
+
             time_since_seen = now - last_seen
-            
-            # CONSERVADOR: Só marca morto se passou MUITO tempo
-            if time_since_seen > timeout:
+            prev_state = info.get('state', 'alive')
+
+            if time_since_seen < lost_threshold:
+                self.neighbors[n_ip]['state'] = 'alive'
+            elif time_since_seen < dead_threshold:
+                self.neighbors[n_ip]['state'] = 'lost'
+                if prev_state != 'lost':
+                    print(f"[{self.node_id}] ⚠️ Vizinho {n_ip} marcado como LOST (sem resposta {time_since_seen:.1f}s)")
+            else:
+                # marcar como dead e remover
+                self.neighbors[n_ip]['state'] = 'dead'
                 dead_neighbors.append(n_ip)
-                dead_info[n_ip] = time_since_seen
-                print(f"[{self.node_id}] ⚠️ Vizinho {n_ip} sem resposta há {time_since_seen:.1f}s (timeout={timeout}s)")
-        
+                print(f"[{self.node_id}] ☠️ Vizinho {n_ip} considerado DEAD (sem resposta {time_since_seen:.1f}s)")
+
         if dead_neighbors:
+            # Remover dead neighbors e tentar recalcular rotas afetadas
             for dead_ip in dead_neighbors:
-                print(f"[{self.node_id}] ☠️ Vizinho MORTO: {dead_ip} (sem resposta há {dead_info[dead_ip]:.1f}s)")
                 del self.neighbors[dead_ip]
-                
-                # REMOVER rotas que usam esse vizinho como next hop
+
                 routes_removed = []
                 for stream_id, entry in list(self.routing_table.items()):
                     if entry.proximo_salto_ip == dead_ip:
-                        print(f"[{self.node_id}] ❌ REMOVENDO rota para {stream_id} (next hop {dead_ip} morto)")
-                        routes_removed.append(stream_id)
-                        del self.routing_table[stream_id]
-                
-                # LIMPAR TODAS AS LSAs para permitir re-flood
+                        # Procurar alternativas nas LSAs conhecidas para este stream
+                        candidates = []
+                        for lsa_key, lsa_info in self.lsa_database.items():
+                            sid, origin_seq = lsa_key
+                            if sid != stream_id:
+                                continue
+                            sender = lsa_info.get('sender')
+                            cost = lsa_info.get('cost', float('inf'))
+                            lsa_time = lsa_info.get('time', 0)
+                            lsa_age = time.time() - lsa_time
+                            
+                            # MODO AGRESSIVO: tentar TODAS as LSAs disponíveis
+                            # Prioridade 1: vizinhos vivos
+                            # Prioridade 2: LSAs recentes (< dead_threshold)
+                            # Prioridade 3: LSAs antigas mas ainda válidas (< 60s)
+                            ninfo = self.neighbors.get(sender)
+                            
+                            if ninfo and ninfo.get('state') == 'alive':
+                                # Vizinho vivo - prioridade máxima
+                                candidates.append((cost, sender, origin_seq, 0))  # prioridade 0 (melhor)
+                            elif lsa_age < dead_threshold:
+                                # LSA recente - boa prioridade
+                                candidates.append((cost, sender, origin_seq, 1))
+                            elif lsa_age < 60.0:
+                                # LSA antiga mas ainda pode funcionar - última tentativa
+                                penalty = cost * 0.2  # penalidade de 20%
+                                candidates.append((cost + penalty, sender, origin_seq, 2))
+                            # Se nenhuma das condições, não adicionar (LSA muito antiga)
+
+                        if candidates:
+                            # Ordenar por prioridade primeiro, depois por custo
+                            candidates.sort(key=lambda x: (x[3], x[0]))  # (prioridade, custo)
+                            best_cost, best_sender, best_origin, priority = candidates[0]
+                            priority_label = ['vizinho vivo', 'LSA recente', 'LSA antiga'][priority]
+                            self.routing_table[stream_id] = RouteEntry(stream_id, best_sender, best_cost)
+                            self.routing_table[stream_id].last_update = time.time()
+                            print(f"[{self.node_id}] 🔁 Rota para {stream_id} recalculada: via {best_sender} (custo {best_cost:.2f}, {priority_label})")
+                            if len(candidates) > 1:
+                                print(f"[{self.node_id}]    └─ {len(candidates)-1} alternativa(s) disponível(eis)")
+                        else:
+                            print(f"[{self.node_id}] ❌ REMOVENDO rota para {stream_id} (next hop {dead_ip} morto)")
+                            routes_removed.append(stream_id)
+                            del self.routing_table[stream_id]
+
                 if routes_removed:
-                    print(f"[{self.node_id}] 🧹 LIMPANDO TODAS as LSAs para permitir nova descoberta")
-                    self.lsa_database.clear()
-                    print(f"[{self.node_id}] 🔄 {len(routes_removed)} rota(s) removida(s), PRONTO para novos FLOODs")
-        
+                    # NÃO limpar TODAS as LSAs - apenas as do vizinho morto específico!
+                    # Isso mantém LSAs de caminhos alternativos para failover futuro
+                    lsas_deleted = 0
+                    for sid in routes_removed:
+                        for k in list(self.lsa_database.keys()):
+                            lsa_stream_id, lsa_seq = k
+                            lsa_sender = self.lsa_database[k].get('sender')
+                            # Só deletar LSAs deste stream que vieram do vizinho morto
+                            if lsa_stream_id == sid and lsa_sender == dead_ip:
+                                del self.lsa_database[k]
+                                lsas_deleted += 1
+                    print(f"[{self.node_id}] 🧹 Removidas {lsas_deleted} LSAs do vizinho morto (mantendo alternativas)")
+                    print(f"[{self.node_id}] 📊 LSAs restantes: {len(self.lsa_database)} (podem conter rotas alternativas)")
+
         return dead_neighbors
 
     def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"") -> bytes:
@@ -113,6 +182,7 @@ class OverlayNode:
         if sender_ip in self.neighbors:
             # SEMPRE atualizar last_seen quando recebe HELLO
             self.neighbors[sender_ip]['last_seen'] = now
+            self.neighbors[sender_ip]['state'] = 'alive'
             return json.dumps({"ack_seq": header['seq']}).encode('utf-8')
         return b""
 
@@ -131,41 +201,9 @@ class OverlayNode:
                     new_metric = (0.7 * old_metric) + (0.3 * rtt_ms)
                     self.neighbors[sender_ip]['metric'] = new_metric
                     self.neighbors[sender_ip]['last_seen'] = now  #FIX!
+                    self.neighbors[sender_ip]['state'] = 'alive'
         except: pass
 
-    '''def handle_flood(self, header, payload, sender_ip_real):
-        try:
-            data = json.loads(payload.decode('utf-8'))
-            stream_id = data['stream_id']
-            custo_recebido = data['cost']
-            origin_seq = data['origin_seq']
-        except: return None
-
-        # Modo Estrito: Ignorar flood de desconhecidos
-        if sender_ip_real not in self.neighbors: return None
-
-        lsa_key = (stream_id, origin_seq)
-        if lsa_key in self.lsa_database: return None
-        self.lsa_database[lsa_key] = time.time()
-
-        metric_link = self.neighbors[sender_ip_real]['metric']
-        novo_custo = custo_recebido + metric_link
-
-        melhorou = False
-        if stream_id not in self.routing_table:
-            self.routing_table[stream_id] = RouteEntry(stream_id, sender_ip_real, novo_custo)
-            melhorou = True
-        else:
-            rota = self.routing_table[stream_id]
-            if novo_custo < rota.custo_acumulado:
-                rota.proximo_salto_ip = sender_ip_real
-                rota.custo_acumulado = novo_custo
-                melhorou = True
-
-        if melhorou:
-            data['cost'] = novo_custo
-            return json.dumps(data).encode('utf-8')
-        return None '''
 
     def handle_flood(self, header, payload, sender_ip_real):
         try:
@@ -175,13 +213,20 @@ class OverlayNode:
             origin_seq = data['origin_seq']
         except: return None
 
-        # Modo Estrito: Ignorar flood de desconhecidos
+        # DESCOBERTA DINÂMICA: aprender vizinhos através de floods recebidos.
+        # Quando recebe flood de IP desconhecido, registar como vizinho e marcar timestamp.
         if sender_ip_real not in self.neighbors:
-            print(f"[{self.node_id}] ⚠️ FLOOD ignorado: {sender_ip_real} não é vizinho")
-            return None
-        
+            print(f"[{self.node_id}] 🔍 Descoberto novo vizinho via FLOOD: {sender_ip_real}")
+            self.neighbors[sender_ip_real] = {
+                'metric': 50.0, 
+                'last_seen': time.time(), 
+                'state': 'alive', 
+                'missed_hellos': 0,
+                'discovered_via': 'flood'  # Marcar origem da descoberta
+            }
+
         # Verificar se vizinho está respondendo aos HELLOs (verificação leve)
-        neighbor_info = self.neighbors[sender_ip_real]
+        neighbor_info = self.neighbors.get(sender_ip_real, {})
         time_since_seen = time.time() - neighbor_info.get('last_seen', 0)
         # Aceitar floods mesmo de vizinhos que não respondem (broadcast),
         # mas dar preferência a rotas de vizinhos ativos
@@ -197,13 +242,20 @@ class OverlayNode:
                 return None
             # Se não temos rota, aceitar mesmo que seja duplicado (recuperação)
             print(f"[{self.node_id}] 🔓 Aceitando FLOOD duplicado (sem rota válida)")
-        self.lsa_database[lsa_key] = time.time()
-        
-        # DEBUG: Confirmar recepção de flood novo
-        print(f"[{self.node_id}] 📡 Flood recebido: {stream_id} de {sender_ip_real} (custo={custo_recebido:.2f})")
 
-        metric_link = self.neighbors[sender_ip_real]['metric']
+        # Calcular custo atualizado e guardar metadados do LSA para recomputação
+        metric_link = self.neighbors[sender_ip_real].get('metric', 50.0)
         novo_custo = custo_recebido + metric_link
+
+        self.lsa_database[lsa_key] = {
+            'time': time.time(),
+            'data': data,
+            'sender': sender_ip_real,
+            'cost': novo_custo
+        }
+
+        # DEBUG: Confirmar recepção de flood novo
+        print(f"[{self.node_id}] 📡 Flood recebido: {stream_id} de {sender_ip_real} (custo={novo_custo:.2f})")
 
         # --- LÓGICA DE ROTEAMENTO DINÂMICO ---
         should_propagate = False
@@ -264,35 +316,45 @@ class OverlayNode:
     
     def handle_join(self, payload, sender_ip_real):
         """
-        Retorna: (upstream_ip, send_ack)
+        Retorna: (upstream_ip, send_ack, already_receiving)
+        - upstream_ip: para onde propagar o JOIN (None se não propagar, "SOURCE" se sou a fonte)
+        - send_ack: se deve enviar ACK ao sender
+        - already_receiving: True se já estou recebendo este stream (não preciso propagar)
         """
         try:
             data = json.loads(payload.decode('utf-8'))
             target_stream = data['stream_id']
-        except: return None, False
+        except: return None, False, False
 
-        # Se sou Streamer
+        # Se sou Streamer (SOURCE)
         if self.node_id == target_stream:
             if target_stream not in self.routing_table:
                 self.routing_table[target_stream] = RouteEntry(target_stream, "SELF", 0.0)
                 print(f"[{self.node_id}] 📝 Entrada de roteamento criada para SELF")
             entry = self.routing_table[target_stream]
+            was_first = len(entry.downstream_ips) == 0
             if sender_ip_real not in entry.downstream_ips:
                 entry.downstream_ips.add(sender_ip_real)
                 print(f"[{self.node_id}] 🎬 NOVO CLIENTE: {sender_ip_real} (total: {len(entry.downstream_ips)})")
             else:
                 print(f"[{self.node_id}] ⚠️ Cliente já existe: {sender_ip_real}")
-            return "SOURCE", True # True = Enviar ACK
+            return "SOURCE", True, True  # Sou a fonte, já estou "recebendo" (gerando)
 
-        # Se sou Router
+        # Se sou Router e JÁ tenho rota para este stream
         if target_stream in self.routing_table:
             entry = self.routing_table[target_stream]
+            was_first = len(entry.downstream_ips) == 0
             if sender_ip_real not in entry.downstream_ips:
                 entry.downstream_ips.add(sender_ip_real)
-                print(f"[{self.node_id}] 🔌 Cliente adicionado: {sender_ip_real}")
-            return entry.proximo_salto_ip, True # True = Enviar ACK
+                print(f"[{self.node_id}] 🔌 Cliente adicionado: {sender_ip_real} (total: {len(entry.downstream_ips)})")
+                if was_first:
+                    print(f"[{self.node_id}]    └─ Primeiro cliente! Preciso propagar JOIN upstream")
+                else:
+                    print(f"[{self.node_id}]    └─ Já estou recebendo stream, apenas adicionei aos downstreams")
+            return entry.proximo_salto_ip, True, (not was_first)  # already_receiving = True se não era o primeiro
         
-        return None, False
+        # Não tenho rota para este stream
+        return None, False, False
 
     def handle_leave(self, payload, sender_ip_real):
         try:
@@ -326,4 +388,23 @@ class OverlayNode:
         if target_stream in self.routing_table:
             entry = self.routing_table[target_stream]
             return entry.proximo_salto_ip
+        return None
+
+    def handle_debug(self, header, payload, sender_ip_real):
+        """Handler minimal para pedidos debug/consulta de rotas.
+
+        Payload esperado: JSON {"cmd": "route_request"}
+        Resposta: JSON {'routes': { stream_id: { 'cost': float } }}
+        """
+        try:
+            data = json.loads(payload.decode('utf-8'))
+            cmd = data.get('cmd')
+        except:
+            return None
+
+        if cmd == 'route_request':
+            routes = {}
+            for sid, entry in self.routing_table.items():
+                routes[sid] = {'cost': entry.custo_acumulado}
+            return json.dumps({'routes': routes}).encode('utf-8')
         return None

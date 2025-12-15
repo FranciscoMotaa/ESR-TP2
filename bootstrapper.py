@@ -13,6 +13,9 @@ BIND_PORT = 6000
 MONITOR_PORT = 6001  # Porta UDP para receber updates de estado
 NODE_DEFAULT_PORT = 50000  # Porta que os nós usam para comunicação
 TOPOLOGY_FILE = "bootstrap_conf.json"
+# Thresholds para monitorização (segundos)
+MONITOR_LOST_THRESHOLD = 10
+MONITOR_DEAD_THRESHOLD = 30
 
 # Estruturas de dados para monitorização
 node_state = {}
@@ -49,21 +52,32 @@ def notify_new_node(new_node_id, new_node_ip):
     with state_lock:
         for other_node_id, info in node_state.items():
             if other_node_id == new_node_id: continue
-            
-            # --- FILTRO DE TOPOLOGIA (CORREÇÃO CRÍTICA) ---
-            # Só notifica se estiverem ligados no JSON
-            allowed_neighbors_ips = static_topology.get(other_node_id, [])
-            
-            if new_node_ip in allowed_neighbors_ips:
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    sock.settimeout(0.5)
-                    other_ip = info.get("ip")
-                    if other_ip:
-                        sock.sendto(notification, (other_ip, NODE_DEFAULT_PORT))
-                    sock.close()
-                    print(f"   -> Notificado {other_node_id} sobre vizinho {new_node_id}")
-                except Exception: pass
+
+            # Support topology entries that are either node IDs or direct IPs.
+            allowed_entries = static_topology.get(other_node_id, [])
+            notify = False
+            for entry in allowed_entries:
+                # If entry looks like an IP address, compare with new_node_ip
+                if isinstance(entry, str) and '.' in entry:
+                    if entry == new_node_ip:
+                        notify = True; break
+                else:
+                    if entry == new_node_id:
+                        notify = True; break
+
+            if not notify:
+                continue
+
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(0.5)
+                other_ip = info.get("ip")
+                if other_ip:
+                    sock.sendto(notification, (other_ip, NODE_DEFAULT_PORT))
+                sock.close()
+                print(f"   -> Notificado {other_node_id} sobre vizinho {new_node_id}")
+            except Exception:
+                pass
 
 
 def handle_client(client_sock, addr):
@@ -97,15 +111,38 @@ def handle_client(client_sock, addr):
                 node_state[node_id]["last_seen"] = time.time()
 
             # 2. FILTRO DE VIZINHOS (CORREÇÃO CRÍTICA)
-            # Devolve apenas os vizinhos que estão no JSON
-            response_neighbors = static_topology.get(node_id, [])
+            # A topologia no JSON lista neighbor IDs; aqui devolvemos apenas os
+            # IPs dos vizinhos que já estão registados no tracker.
+            response_neighbors = []
+            for neigh in static_topology.get(node_id, []):
+                # If the topology entry looks like an IP, return it directly.
+                if isinstance(neigh, str) and '.' in neigh:
+                    response_neighbors.append(neigh)
+                    continue
+
+                # Otherwise treat it as a node ID and return the registered IP if available
+                neigh_info = node_state.get(neigh)
+                if neigh_info and neigh_info.get('ip'):
+                    response_neighbors.append(neigh_info.get('ip'))
 
         response = json.dumps({"status": "OK", "neighbors": response_neighbors})
         try: client_sock.send(response.encode("utf-8"))
         except: pass
 
         if is_new_registration:
+            # Notificar vizinhos já registados
             threading.Thread(target=notify_new_node, args=(node_id, node_ip), daemon=True).start()
+
+        # Enviar ao próprio nó uma lista inicial de vizinhos (batch), caso existam
+        try:
+            if response_neighbors:
+                batch = json.dumps({"type": "neighbor_batch", "neighbors": response_neighbors}).encode('utf-8')
+                send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                send_sock.settimeout(0.5)
+                send_sock.sendto(batch, (node_ip, NODE_DEFAULT_PORT))
+                send_sock.close()
+        except Exception:
+            pass
 
     except Exception: pass
     finally:
@@ -216,12 +253,17 @@ def display_monitor():
             print("=" * 100)
 
             # TABELA NÓS
-            print(f"{'ID':<10} {'STATUS':<8} {'IP':<15} {'VIZINHOS ATIVOS'}")
+            print(f"{ 'ID':<10} {'STATUS':<8} {'IP':<15} {'VIZINHOS ATIVOS'}")
             active_streamers = []
             for nid in sorted(node_state.keys()):
                 info = node_state[nid]
-                alive = (now - info['last_seen']) < 10
-                status = "ONLINE" if alive else "OFF"
+                age = now - info['last_seen']
+                if age < MONITOR_LOST_THRESHOLD:
+                    status = 'ALIVE'
+                elif age < MONITOR_DEAD_THRESHOLD:
+                    status = 'LOST'
+                else:
+                    status = 'DEAD'
                 neighbors = info.get('neighbors', {})
                 
                 active_neighbors = []
@@ -237,7 +279,7 @@ def display_monitor():
                 
                 print(f"{nid:<10} {status:<8} {info.get('ip'):<15} {', '.join(active_neighbors)}")
                 
-                if "STREAMER" in nid and alive: active_streamers.append(nid)
+                if "STREAMER" in nid and status == 'ALIVE': active_streamers.append(nid)
 
             # ÁRVORE
             print("\n" + "="*100)

@@ -11,7 +11,7 @@ import subprocess
 import traceback
 import threading
 
-from utils import get_interface_ip
+from utils import get_interface_ip, measure_rtt
 from overlay_structs import OverlayNode, MsgType, MAX_PACKET_SIZE
 
 DEFAULT_PORT = 50000
@@ -191,9 +191,13 @@ def main():
     else:
         print(f"[SECURITY] ⚠️  Criptografia DESATIVADA (modo debug) - PACOTES EM CLARO!")
     
-    # Adicionar vizinhos iniciais
+    # Adicionar vizinhos iniciais (medir RTT inicialmente quando possível)
     for neighbor_ip in initial_neighbors:
-        node.neighbors[neighbor_ip] = {'metric': 50.0, 'last_seen': time.time(), 'state': 'alive', 'missed_hellos': 0}
+        try:
+            rtt = measure_rtt(neighbor_ip, timeout=1)
+        except Exception:
+            rtt = None
+        node.neighbors[neighbor_ip] = {'metric': rtt, 'last_seen': time.time(), 'state': 'alive', 'missed_hellos': 0}
 
     # Socket UDP
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -212,6 +216,11 @@ def main():
         try:
             # Hello
             pkt = node.pack_message(MsgType.HELLO, n_ip, b"")
+            # Registar ping para medir RTT quando chegar HELLO_RESPONSE
+            try:
+                node.pending_pings[node.sequence_number] = time.time()
+            except:
+                pass
             sock.sendto(pkt, (n_ip, DEFAULT_PORT))
             # Route Request
             req = json.dumps({'cmd': 'route_request'}).encode('utf-8')
@@ -387,7 +396,12 @@ def main():
                 # --- 2. HELLOS ---
                 if now - last_hello >= HELLO_INTERVAL:
                     for n_ip in list(node.neighbors.keys()):
-                        sock.sendto(node.pack_message(MsgType.HELLO, n_ip, b""), (n_ip, DEFAULT_PORT))
+                        pkt = node.pack_message(MsgType.HELLO, n_ip, b"")
+                        try:
+                            node.pending_pings[node.sequence_number] = time.time()
+                        except:
+                            pass
+                        sock.sendto(pkt, (n_ip, DEFAULT_PORT))
                     last_hello = now
 
                 # --- 3. FLOOD (Streamer) ---
@@ -406,7 +420,7 @@ def main():
                             r_data[sid] = {'next_hop': entry.proximo_salto_ip, 'cost': entry.custo_acumulado, 'downstream': list(entry.downstream_ips)}
                         update = json.dumps({
                             'node_id': args.node_id, 'ips': ips,
-                            'neighbors': {k: v.get('metric',0) for k,v in node.neighbors.items()},
+                            'neighbors': {k: v.get('metric') for k,v in node.neighbors.items()},
                             'routing_table': r_data, 'streams': list(node.routing_table.keys())
                         }).encode('utf-8')
                         sock.sendto(update, (args.tracker, MONITOR_PORT))
@@ -496,13 +510,26 @@ def main():
                                 if note.get('type') == 'neighbor_update':
                                     nip = note.get('new_neighbor')
                                     if nip and nip not in node.neighbors:
-                                        node.neighbors[nip] = {'metric':50.0, 'last_seen':time.time(), 'state':'alive'}
-                                        sock.sendto(node.pack_message(MsgType.HELLO, nip, b""), (nip, DEFAULT_PORT))
+                                        try:
+                                            rtt_n = measure_rtt(nip, timeout=1)
+                                        except:
+                                            rtt_n = None
+                                        node.neighbors[nip] = {'metric':rtt_n, 'last_seen':time.time(), 'state':'alive'}
+                                        pkt = node.pack_message(MsgType.HELLO, nip, b"")
+                                        try:
+                                            node.pending_pings[node.sequence_number] = time.time()
+                                        except:
+                                            pass
+                                        sock.sendto(pkt, (nip, DEFAULT_PORT))
                                     continue
                                 if note.get('type') == 'neighbor_batch':
                                     for nip in note.get('neighbors', []):
                                         if nip and nip not in node.neighbors:
-                                            node.neighbors[nip] = {'metric':50.0, 'last_seen':time.time(), 'state':'alive'}
+                                            try:
+                                                rtt_n = measure_rtt(nip, timeout=1)
+                                            except:
+                                                rtt_n = None
+                                            node.neighbors[nip] = {'metric':rtt_n, 'last_seen':time.time(), 'state':'alive'}
                                     continue
                             except: pass
 
@@ -546,6 +573,14 @@ def main():
                                                     if nh != "SELF":
                                                         print(f"[⚡ FLOOD] Rota encontrada! Conectando a {nh}")
                                                         join_state['active'] = True; join_state['target_ip'] = nh; join_state['retries'] = 0; join_state['last_sent'] = 0
+                                
+                                if was_new: # Se descobri vizinho via flood, digo olá
+                                    pkt = node.pack_message(MsgType.HELLO, sender_ip, b"")
+                                    try:
+                                        node.pending_pings[node.sequence_number] = time.time()
+                                    except:
+                                        pass
+                                    sock.sendto(pkt, (sender_ip, DEFAULT_PORT))
 
                             elif mtype == MsgType.STREAM_JOIN:
                                 up, ack, _ = node.handle_join(payload, sender_ip)
@@ -617,7 +652,7 @@ def main():
                                     routes = reply_data.get('routes', {})
                                     
                                     # Custo do link para este vizinho
-                                    metric = node.neighbors.get(sender_ip, {}).get('metric', 50.0)
+                                    metric = node.get_link_metric(sender_ip)
                                     
                                     updated_count = 0
                                     
@@ -655,7 +690,16 @@ def main():
                     if cmd == "status":
                         print(f"--- {args.node_id} ---")
                         print(f"Vizinhos: {len(node.neighbors)}")
-                        for k,v in node.neighbors.items(): print(f"  {k}: {v.get('state')} {v.get('metric',0):.1f}ms")
+                        for k,v in node.neighbors.items():
+                            m = v.get('metric')
+                            if m is None:
+                                m_disp = '(?)'
+                            else:
+                                try:
+                                    m_disp = f"{m:.1f}ms"
+                                except:
+                                    m_disp = str(m)
+                            print(f"  {k}: {v.get('state')} {m_disp}")
                         for sid, r in node.routing_table.items(): 
                             print(f"Rota {sid}: via {r.proximo_salto_ip} (custo {r.custo_acumulado:.1f}) Clientes: {r.downstream_ips}")
                         if join_state.get('stream_id'):

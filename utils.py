@@ -1,6 +1,11 @@
 import socket
 import fcntl
+import socket
+import fcntl
 import struct
+import subprocess
+import re
+
 
 def get_interface_ip(ifname='eth0'):
     """
@@ -16,11 +21,9 @@ def get_interface_ip(ifname='eth0'):
             struct.pack('256s', bytes(ifname[:15], 'utf-8'))
         )[20:24]
         return socket.inet_ntoa(ip_bytes)
-    except Exception as e:
+    except Exception:
         # Fallback para debug fora do CORE
-        # Tentar hostname -I como fallback (mais robusto em ambientes CORE/containers)
         try:
-            import subprocess
             out = subprocess.check_output(['hostname', '-I']).decode('utf-8').strip()
             if out:
                 # Escolher o primeiro IP que não seja loopback
@@ -30,5 +33,21 @@ def get_interface_ip(ifname='eth0'):
                 return out.split()[0]
         except Exception:
             pass
-        print(f"[WARN] Não foi possível obter IP da {ifname}: {e}")
         return "127.0.0.1"
+
+
+def measure_rtt(host: str, count: int = 1, timeout: int = 1) -> float:
+    """Tenta medir RTT ao `host` usando o utilitário `ping` do sistema.
+    Retorna o tempo em ms (float) ou None se falhar.
+    """
+    try:
+        # -c count, -W timeout (seconds) para espera por reply
+        p = subprocess.run(['ping', '-c', str(count), '-W', str(timeout), host], capture_output=True, text=True, timeout=timeout+1)
+        out = p.stdout
+        # Procura por 'time=X ms'
+        m = re.search(r'time=([0-9]+\.?[0-9]*)\s*ms', out)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return None

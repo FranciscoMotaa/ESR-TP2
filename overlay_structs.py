@@ -337,6 +337,15 @@ class OverlayNode:
         self.stats_encrypted_sent = 0
         self.stats_encrypted_recv = 0
         self.stats_decrypt_failed = 0
+
+    def get_link_metric(self, ip: str, fallback: float = 1000.0) -> float:
+        """Retorna a métrica do link para `ip`. Se indefinida retorna um fallback alto
+        para evitar escolher links não medidos como preferenciais."""
+        info = self.neighbors.get(ip)
+        if not info:
+            return fallback
+        m = info.get('metric')
+        return m if (m is not None) else fallback
     
     def check_dead_neighbors(self, timeout=20.0):
         now = time.time()
@@ -506,8 +515,11 @@ class OverlayNode:
                 start_time = self.pending_pings.pop(ack_seq)
                 rtt_ms = (now - start_time) * 1000.0 
                 if sender_ip in self.neighbors:
-                    old_metric = self.neighbors[sender_ip].get('metric', rtt_ms)
-                    new_metric = (0.7 * old_metric) + (0.3 * rtt_ms)
+                    old_metric = self.neighbors[sender_ip].get('metric')
+                    if old_metric is None:
+                        new_metric = rtt_ms
+                    else:
+                        new_metric = (0.7 * old_metric) + (0.3 * rtt_ms)
                     self.neighbors[sender_ip]['metric'] = new_metric
                     self.neighbors[sender_ip]['last_seen'] = now
                     self.neighbors[sender_ip]['state'] = 'alive'
@@ -539,7 +551,7 @@ class OverlayNode:
             if stream_id in self.routing_table: return None
             # print(f"[{self.node_id}] 🔓 Aceitando FLOOD duplicado (sem rota válida)")
 
-        metric_link = self.neighbors[sender_ip_real].get('metric', 50.0)
+        metric_link = self.get_link_metric(sender_ip_real)
         novo_custo = custo_recebido + metric_link
 
         # GUARDAR METADADOS COMPLETOS (IMPORTANTE PARA FAILOVER)

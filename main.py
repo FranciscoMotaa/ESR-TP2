@@ -387,7 +387,20 @@ def main():
                 # --- 2. HELLOS ---
                 if now - last_hello >= HELLO_INTERVAL:
                     for n_ip in list(node.neighbors.keys()):
-                        sock.sendto(node.pack_message(MsgType.HELLO, n_ip, b""), (n_ip, DEFAULT_PORT))
+                        # 1. Guarda o número de sequência ATUAL antes de empacotar
+                        # (Isto é importante porque o pack_message pode incrementar o número a seguir)
+                        seq = node.sequence_number
+                        
+                        # 2. Cria o pacote
+                        pkt = node.pack_message(MsgType.HELLO, n_ip, b"")
+                        
+                        # 3. LIGA O CRONÓMETRO (A linha que faltava!)
+                        # Se usarmos 'seq' garantimos que a chave coincide com o pacote enviado
+                        node.pending_pings[seq] = now
+                        
+                        # 4. Envia
+                        sock.sendto(pkt, (n_ip, DEFAULT_PORT))
+                    
                     last_hello = now
 
                 # --- 3. FLOOD (Streamer) ---
@@ -425,16 +438,40 @@ def main():
                     last_upstream_maint = now
 
                 # --- 6. QoS ---
+                # --- 6. QoS (CORRIGIDO) ---
+                # --- 6. QoS (CORRIGIDO PARA CUSTO TOTAL) ---
                 if "C" in args.node_id and now - last_report >= 2.0:
-                    if stats_frames_received > 0:
-                        expect = last_seq_received - (last_seq_received - stats_frames_received) # Aproximação
-                        # Simples loss report
-                        pl = json.dumps({"stream_id": join_state['stream_id'], "client_id": args.node_id, "loss_rate": 0}).encode('utf-8') # Simplificado
-                        if join_state.get('parent_ip'):
-                            sock.sendto(node.pack_message(MsgType.STREAM_REPORT, join_state['parent_ip'], pl), (join_state['parent_ip'], DEFAULT_PORT))
-                        stats_frames_received = 0
-                    last_report = now
+                    total_expected = stats_frames_received + stats_frames_lost
+                    
+                    if total_expected > 0:
+                        loss_pct = (stats_frames_lost / total_expected) * 100.0
+                        
+                        # MUDANÇA: Ler o custo acumulado total da tabela de rotas
+                        # Isto inclui a soma de todas as latências desde o Streamer até aqui
+                        total_latency = 0.0
+                        stream_id = join_state.get('stream_id')
+                        if stream_id and stream_id in node.routing_table:
+                            total_latency = node.routing_table[stream_id].custo_acumulado
 
+                        # Debug para veres o valor a subir no terminal do cliente
+                        # if total_latency > 200:
+                        #    print(f"[{args.node_id}] 🐌 Latência Total Alta: {total_latency:.1f}ms")
+
+                        pl = json.dumps({
+                            "stream_id": stream_id, 
+                            "client_id": args.node_id, 
+                            "loss_rate": loss_pct,
+                            "rtt": total_latency  # Enviamos o total como RTT
+                        }).encode('utf-8')
+                        
+                        parent = join_state.get('parent_ip')
+                        if parent:
+                            sock.sendto(node.pack_message(MsgType.STREAM_REPORT, parent, pl), (parent, DEFAULT_PORT))
+                        
+                        stats_frames_received = 0
+                        stats_frames_lost = 0
+                    
+                    last_report = now
                 # --- 7. STREAMER SEND ---
                 if "STREAMER" in args.node_id:
                     has_clients = False
@@ -496,13 +533,13 @@ def main():
                                 if note.get('type') == 'neighbor_update':
                                     nip = note.get('new_neighbor')
                                     if nip and nip not in node.neighbors:
-                                        node.neighbors[nip] = {'metric':50.0, 'last_seen':time.time(), 'state':'alive'}
+                                        node.neighbors[nip] = {'metric':0.1, 'last_seen':time.time(), 'state':'alive'}
                                         sock.sendto(node.pack_message(MsgType.HELLO, nip, b""), (nip, DEFAULT_PORT))
                                     continue
                                 if note.get('type') == 'neighbor_batch':
                                     for nip in note.get('neighbors', []):
                                         if nip and nip not in node.neighbors:
-                                            node.neighbors[nip] = {'metric':50.0, 'last_seen':time.time(), 'state':'alive'}
+                                            node.neighbors[nip] = {'metric':0.1, 'last_seen':time.time(), 'state':'alive'}
                                     continue
                             except: pass
 
@@ -581,18 +618,23 @@ def main():
                                 if up and up!="SOURCE": 
                                     sock.sendto(node.pack_message(MsgType.STREAM_REPORT, up, payload), (up, DEFAULT_PORT))
                                 elif up == "SOURCE" and ffmpeg_source:
-                                    # QoS Lógica
                                     try:
-                                        l = json.loads(payload).get('loss_rate', 0.0)
+                                        data = json.loads(payload)
+                                        l = data.get('loss_rate', 0.0)
+                                        rtt = data.get('rtt', 0.0) # Isto agora é a Latência Total
+                                        
                                         if time.time() - last_quality_switch > 15.0:
-                                            if l > 10.0 and ffmpeg_source.current_quality == 'HIGH':
+                                            # Se Perda > 10% OU Latência Total > 200ms -> Baixa Qualidade
+                                            if (l > 10.0 or rtt > 200.0) and ffmpeg_source.current_quality == 'HIGH':
                                                 ffmpeg_source.close(); ffmpeg_source = FFmpegStreamer(current_video_file, 'LOW'); last_quality_switch = time.time()
-                                                print("[QoS] Baixando qualidade (Perda alta)")
-                                            elif l < 2.0 and ffmpeg_source.current_quality == 'LOW':
+                                                reason = f"Perda {l:.1f}%" if l > 10.0 else f"Latência {rtt:.0f}ms"
+                                                print(f"[QoS] 📉 Baixando qualidade ({reason})")
+                                            
+                                            # Se Perda < 2% E Latência Total < 100ms -> Sobe Qualidade
+                                            elif (l < 2.0 and rtt < 100.0) and ffmpeg_source.current_quality == 'LOW':
                                                 ffmpeg_source.close(); ffmpeg_source = FFmpegStreamer(current_video_file, 'HIGH'); last_quality_switch = time.time()
-                                                print("[QoS] Subindo qualidade (Rede boa)")
+                                                print(f"[QoS] 📈 Subindo qualidade (Rede Estável: {rtt:.0f}ms)")
                                     except: pass
-
                             elif mtype == MsgType.STREAM_DATA:
                                 # Data Forwarding
                                 info = json.loads(payload); sid = info.get('id')

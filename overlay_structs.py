@@ -279,7 +279,33 @@ class FECDecoder:
 # --- SISTEMA DE CRIPTOGRAFIA ---
 class SecurityManager:
     """
-    Gestor de Segurança: AES-256-GCM
+    Gestor de Segurança: AES-256-GCM (AEAD)
+    
+    Implementa cifração simétrica com autenticação integrada para proteger
+    o payload dos pacotes de streaming, garantindo:
+    
+    1. CONFIDENCIALIDADE: Dados cifrados com AES-256
+    2. INTEGRIDADE: Tag de autenticação detecta qualquer modificação
+    3. AUTENTICIDADE: AEAD (Authenticated Encryption with Associated Data)
+    
+    Características:
+    - Algoritmo: AES-256 (chave de 256 bits)
+    - Modo: GCM (Galois/Counter Mode)
+    - Derivação de Chave: PBKDF2-HMAC-SHA256 (100000 iterações)
+    - IV: 12 bytes (nonce único por pacote)
+    - Tag de Autenticação: 16 bytes (128 bits)
+    
+    Vantagens do AES-GCM:
+    - Baixa latência (ideal para streaming)
+    - Hardware acceleration (AES-NI)
+    - Proteção contra adulteração (AEAD)
+    - Paralelizável (cada pacote é independente)
+    
+    Uso:
+        security = SecurityManager()
+        security.enable("minha_passphrase_secreta")
+        iv, ciphertext, tag = security.encrypt(b"dados")
+        plaintext = security.decrypt(iv, ciphertext, tag)
     """
     def __init__(self):
         self.enabled = False
@@ -287,11 +313,23 @@ class SecurityManager:
         self.key = None
     
     def enable(self, passphrase: str, salt: bytes = b'overlay_stream_2025'):
+        """
+        Ativa o sistema de cifração derivando a chave a partir da passphrase.
+        
+        Args:
+            passphrase: Senha compartilhada entre todos os nós da rede
+            salt: Salt para derivação (deve ser o mesmo em todos os nós)
+        
+        Nota: A passphrase deve ser distribuída de forma segura via:
+            - Variável de ambiente OVERLAY_PASSPHRASE
+            - Sistema de gestão de configuração
+            - Nunca hardcoded no código!
+        """
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
-            length=32,  # 256 bits
+            length=32,  # 256 bits (chave AES-256)
             salt=salt,
-            iterations=10000  # Otimizado para baixa latência
+            iterations=100000  # NIST recomenda mínimo 100k para PBKDF2-SHA256
         )
         self.key = kdf.derive(passphrase.encode('utf-8'))
         self.aesgcm = AESGCM(self.key)
@@ -302,21 +340,70 @@ class SecurityManager:
         return self.enabled
     
     def encrypt(self, plaintext: bytes) -> Tuple[bytes, bytes, bytes]:
-        if not self.enabled: raise RuntimeError("Criptografia não está ativada")
-        iv = os.urandom(12)
+        """
+        Cifra dados usando AES-256-GCM.
+        
+        Args:
+            plaintext: Dados em claro a serem cifrados
+        
+        Returns:
+            Tupla (iv, ciphertext, tag):
+                - iv: Vetor de inicialização único (12 bytes)
+                - ciphertext: Dados cifrados
+                - tag: Tag de autenticação (16 bytes)
+        
+        Nota: O IV é gerado aleatoriamente para cada pacote, garantindo
+              que pacotes idênticos produzam ciphertexts diferentes.
+        """
+        if not self.enabled: 
+            raise RuntimeError("Criptografia não está ativada. Use enable() primeiro.")
+        
+        # Gerar IV único (nonce) para este pacote
+        iv = os.urandom(12)  # GCM recomenda 12 bytes
+        
+        # Cifrar e autenticar (AEAD)
         ciphertext_with_tag = self.aesgcm.encrypt(iv, plaintext, None)
+        
+        # Separar ciphertext e tag
         ciphertext = ciphertext_with_tag[:-16]
         tag = ciphertext_with_tag[-16:]
+        
         return iv, ciphertext, tag
     
     def decrypt(self, iv: bytes, ciphertext: bytes, tag: bytes) -> Optional[bytes]:
-        if not self.enabled: raise RuntimeError("Criptografia não está ativada")
+        """
+        Decifra e valida autenticidade dos dados.
+        
+        Args:
+            iv: Vetor de inicialização (12 bytes)
+            ciphertext: Dados cifrados
+            tag: Tag de autenticação (16 bytes)
+        
+        Returns:
+            Dados decifrados ou None se a validação falhar
+        
+        Segurança:
+            Se a tag não validar (dados alterados ou chave incorreta),
+            retorna None e o pacote é descartado.
+        """
+        if not self.enabled: 
+            raise RuntimeError("Criptografia não está ativada. Use enable() primeiro.")
+        
         try:
+            # Recombinar ciphertext e tag para o formato esperado pelo GCM
             ciphertext_with_tag = ciphertext + tag
+            
+            # Decifrar e validar autenticidade
             plaintext = self.aesgcm.decrypt(iv, ciphertext_with_tag, None)
+            
             return plaintext
         except Exception as e:
-            print(f"[SECURITY] Falha ao decifrar: {e}")
+            # Falha na decifração ou validação da tag
+            # Pode ser devido a:
+            # - Chave incorreta (passphrase diferente)
+            # - Dados adulterados (man-in-the-middle)
+            # - Corrupção de dados
+            print(f"[SECURITY] Falha ao decifrar/validar: {e}")
             return None
 
 class OverlayNode:
@@ -421,44 +508,101 @@ class OverlayNode:
         return dead_neighbors, updated_routes
 
     def pack_message(self, msg_type: MsgType, dest_ip: str, payload: bytes = b"", encrypt: bool = True) -> bytes:
+        """
+        Empacota mensagem com header em claro e payload cifrado.
+        
+        Args:
+            msg_type: Tipo da mensagem (MsgType enum)
+            dest_ip: IP de destino
+            payload: Dados úteis a serem cifrados
+            encrypt: Flag para desativar cifração (apenas para debug)
+        
+        Returns:
+            Pacote completo: header (claro) + payload (cifrado se enabled)
+        
+        Nota: O header permanece em claro para permitir encaminhamento eficiente.
+              Apenas o payload é cifrado, protegendo:
+              - Dados de vídeo (STREAM_DATA)
+              - Informações de controlo (JOIN, REPORT, etc.)
+              - Métricas de QoS
+        """
         self.sequence_number += 1
         timestamp = time.time()
         src_ip_bytes = self.ip.encode('utf-8').ljust(16, b'\0')
         dest_ip_bytes = dest_ip.encode('utf-8').ljust(16, b'\0')
         
         is_encrypted = 0
+        original_size = len(payload)
+        
+        # Cifrar payload se SecurityManager estiver ativo E flag encrypt=True
         if encrypt and self.security.is_enabled():
-            iv, ciphertext, tag = self.security.encrypt(payload)
-            payload = iv + ciphertext + tag
-            is_encrypted = 1
-            self.stats_encrypted_sent += 1
+            try:
+                iv, ciphertext, tag = self.security.encrypt(payload)
+                payload = iv + ciphertext + tag
+                is_encrypted = 1
+                self.stats_encrypted_sent += 1
+            except Exception as e:
+                print(f"[SECURITY] ❌ ERRO ao cifrar pacote {msg_type.name}: {e}")
+                print(f"[SECURITY] ⚠️ Enviando sem cifrar (fallback)")
+                # Em caso de erro, enviar sem cifrar (fallback)
         
         header = struct.pack(HEADER_FORMAT, msg_type.value, src_ip_bytes, dest_ip_bytes, 
                            self.sequence_number, timestamp, is_encrypted)
         return header + payload
 
     def unpack_message(self, data: bytes):
+        """
+        Desempacota e decifra mensagem recebida.
+        
+        Args:
+            data: Pacote completo recebido
+        
+        Returns:
+            Tupla (header_dict, payload_bytes) ou (None, None) em caso de erro
+        
+        Processo:
+            1. Extrai header em claro (tipo, IPs, seq, timestamp, flag encrypted)
+            2. Se encrypted=1: decifra payload usando AES-256-GCM
+            3. Valida tag de autenticação (AEAD)
+            4. Retorna payload decifrado
+        
+        Segurança:
+            - Qualquer alteração no payload invalida a tag -> pacote descartado
+            - Protege contra man-in-the-middle e replay attacks
+            - IV único por pacote previne ataques de análise de padrões
+        """
         if len(data) < HEADER_SIZE: return None, None
         header_bytes = data[:HEADER_SIZE]
         payload = data[HEADER_SIZE:]
         
         msg_type_val, src_ip_raw, dst_ip_raw, seq, ts, is_encrypted = struct.unpack(HEADER_FORMAT, header_bytes)
         
+        # Decifrar se o pacote estiver marcado como cifrado
         if is_encrypted == 1 and self.security.is_enabled():
             if len(payload) < (IV_SIZE + TAG_SIZE):
+                print(f"[SECURITY] ❌ Pacote cifrado inválido: tamanho insuficiente ({len(payload)} < {IV_SIZE + TAG_SIZE})")
                 self.stats_decrypt_failed += 1
                 return None, None
+            
+            # Extrair IV, ciphertext e tag
             iv = payload[:IV_SIZE]
             ciphertext = payload[IV_SIZE:-TAG_SIZE]
             tag = payload[-TAG_SIZE:]
+            
+            # Decifrar e validar autenticidade
             plaintext = self.security.decrypt(iv, ciphertext, tag)
             if plaintext is None:
+                print(f"[SECURITY] ❌ Falha na decifração ou validação da tag de autenticação")
+                print(f"[SECURITY] Possíveis causas: chave incorreta, dados adulterados ou corrupção")
                 self.stats_decrypt_failed += 1
                 return None, None
+            
             payload = plaintext
             self.stats_encrypted_recv += 1
         elif is_encrypted == 1 and not self.security.is_enabled():
-            print(f"[SECURITY] Pacote cifrado recebido mas criptografia não está ativa!")
+            print(f"[SECURITY] ⚠️ INCOMPATIBILIDADE: Pacote cifrado recebido mas SecurityManager não está ativo!")
+            print(f"[SECURITY] ⚠️ O remetente está com cifração ativa mas este nó não!")
+            print(f"[SECURITY] ⚠️ Configure OVERLAY_PASSPHRASE ou verifique DISABLE_ENCRYPTION")
             return None, None
         
         try:

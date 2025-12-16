@@ -21,8 +21,7 @@ VIDEO_SOURCE = "trailer_the_boys.mp4"
 RETRY_WAIT_INTERVAL = 5.0
 
 # --- CONFIGURAÇÃO REDE ---
-CHUNK_SIZE = 500  # Tamanho seguro para evitar fragmentação
-
+CHUNK_SIZE = 1024  # Tamanho seguro para evitar fragmentação
 # --- FUNÇÃO CRÍTICA PARA A ÁRVORE ---
 def get_all_ips():
     """Retorna lista de todos os IPs da máquina."""
@@ -169,6 +168,33 @@ def main():
     
     node = OverlayNode(args.node_id, my_ip, DEFAULT_PORT)
     
+    # --- INICIALIZAR SISTEMA DE CRIPTOGRAFIA ---
+    # Ler passphrase da variável de ambiente
+    passphrase = os.environ.get('OVERLAY_PASSPHRASE', 'default_secure_passphrase_2025')
+    # Flag para desativar cifração em ambiente de debug (útil para análise com Wireshark)
+    disable_encryption = os.environ.get('DISABLE_ENCRYPTION', '0') == '1'
+    
+    print("\n" + "="*70)
+    print("  CONFIGURAÇÃO DE SEGURANÇA - AES-256-GCM")
+    print("="*70)
+    
+    if not disable_encryption:
+        node.security.enable(passphrase)
+        print(f"✅ STATUS: CIFRAÇÃO ATIVADA")
+        print(f"🔐 ALGORITMO: AES-256-GCM (AEAD)")
+        print(f"🔑 DERIVAÇÃO: PBKDF2-HMAC-SHA256 (100k iterações)")
+        print(f"📦 PROTEÇÃO: Todos os payloads serão cifrados e autenticados")
+        print(f"🛡️  INTEGRIDADE: Tag de autenticação detecta qualquer modificação")
+        print(f"\n⚠️  Para desativar (apenas para debug): DISABLE_ENCRYPTION=1")
+    else:
+        print(f"❌ STATUS: CIFRAÇÃO DESATIVADA (DISABLE_ENCRYPTION=1)")
+        print(f"⚠️  ATENÇÃO: Todos os pacotes serão enviados EM CLARO!")
+        print(f"⚠️  Os dados podem ser lidos com Wireshark ou tcpdump!")
+        print(f"⚠️  Apenas para ambiente de testes!")
+        print(f"\n🔐 Para ativar: remova DISABLE_ENCRYPTION ou defina =0")
+    
+    print("="*70 + "\n")
+    
     # Adicionar vizinhos iniciais
     for neighbor_ip in initial_neighbors:
         node.neighbors[neighbor_ip] = {'metric': 50.0, 'last_seen': time.time(), 'state': 'alive', 'missed_hellos': 0}
@@ -229,7 +255,7 @@ def main():
     last_route_panic = 0
     
     HELLO_INTERVAL = 1.0   
-    FLOOD_INTERVAL = 1.0   
+    FLOOD_INTERVAL = 5.0   
     JOIN_TIMEOUT = 2.5
     NEIGHBOR_CHECK_INTERVAL = 1.5
     NEIGHBOR_TIMEOUT = 5.0
@@ -471,7 +497,7 @@ def main():
                             if args.node_id in node.routing_table:
                                 for c in node.routing_table[args.node_id].downstream_ips:
                                     sock.sendto(node.pack_message(MsgType.STREAM_DATA, c, pl), (c, DEFAULT_PORT))
-                                    time.sleep(0.001) # Pacing leve
+                                    time.sleep(0.002) # Pacing leve
                         elif raw == b'': 
                             ffmpeg_source.close(); ffmpeg_source = None
 
@@ -673,13 +699,44 @@ def main():
                 elif s is sys.stdin:
                     cmd = sys.stdin.readline().strip()
                     if cmd == "status":
-                        print(f"--- {args.node_id} ---")
-                        print(f"Vizinhos: {len(node.neighbors)}")
-                        for k,v in node.neighbors.items(): print(f"  {k}: {v.get('state')} {v.get('metric',0):.1f}ms")
+                        print(f"\n{'='*60}")
+                        print(f"  STATUS DO NÓ: {args.node_id}")
+                        print(f"{'='*60}")
+                        
+                        # Segurança
+                        enc_status = "✅ ATIVA" if node.security.is_enabled() else "❌ DESATIVADA"
+                        print(f"\n🔐 Cifração: {enc_status}")
+                        if node.security.is_enabled():
+                            total_tx = node.stats_encrypted_sent
+                            total_rx = node.stats_encrypted_recv
+                            failed = node.stats_decrypt_failed
+                            print(f"   ├─ Pacotes cifrados enviados: {total_tx}")
+                            print(f"   ├─ Pacotes cifrados recebidos: {total_rx}")
+                            print(f"   └─ Falhas de decifração: {failed}")
+                            if failed > 0:
+                                print(f"      ⚠️ ATENÇÃO: {failed} pacotes falharam na validação!")
+                                print(f"      Possíveis causas: chave diferente ou dados corrompidos")
+                        
+                        # Vizinhos
+                        print(f"\n👥 Vizinhos: {len(node.neighbors)}")
+                        for k,v in node.neighbors.items(): 
+                            print(f"   └─ {k}: {v.get('state')} ({v.get('metric',0):.1f}ms)")
+                        
+                        # Rotas
+                        print(f"\n🗺️  Rotas: {len(node.routing_table)}")
                         for sid, r in node.routing_table.items(): 
-                            print(f"Rota {sid}: via {r.proximo_salto_ip} (custo {r.custo_acumulado:.1f}) Clientes: {r.downstream_ips}")
+                            print(f"   └─ {sid}: via {r.proximo_salto_ip} (custo {r.custo_acumulado:.1f})")
+                            if r.downstream_ips:
+                                print(f"      Clientes: {r.downstream_ips}")
+                        
+                        # Stream
                         if join_state.get('stream_id'):
-                            print(f"Stream Alvo: {join_state['stream_id']} | Pai: {join_state.get('parent_ip')} | Frames: {stats_frames_received}")
+                            print(f"\n📺 Stream Ativo:")
+                            print(f"   ├─ ID: {join_state['stream_id']}")
+                            print(f"   ├─ Pai: {join_state.get('parent_ip')}")
+                            print(f"   └─ Frames recebidos: {stats_frames_received}")
+                        
+                        print(f"{'='*60}\n")
                     
                     elif cmd.startswith("join"):
                         if "C" in args.node_id and ffplay_sink is None:

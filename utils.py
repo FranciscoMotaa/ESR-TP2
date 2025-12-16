@@ -18,5 +18,17 @@ def get_interface_ip(ifname='eth0'):
         return socket.inet_ntoa(ip_bytes)
     except Exception as e:
         # Fallback para debug fora do CORE
+        # Tentar hostname -I como fallback (mais robusto em ambientes CORE/containers)
+        try:
+            import subprocess
+            out = subprocess.check_output(['hostname', '-I']).decode('utf-8').strip()
+            if out:
+                # Escolher o primeiro IP que não seja loopback
+                for ip in out.split():
+                    if not ip.startswith('127.'):
+                        return ip
+                return out.split()[0]
+        except Exception:
+            pass
         print(f"[WARN] Não foi possível obter IP da {ifname}: {e}")
         return "127.0.0.1"

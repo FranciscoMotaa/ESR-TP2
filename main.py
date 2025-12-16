@@ -216,6 +216,7 @@ def main():
     last_neighbor_check = 0
     last_frame_received_time = 0
     last_quality_switch = 0 
+    last_route_panic = 0
     
     HELLO_INTERVAL = 1.0   
     FLOOD_INTERVAL = 1.0   
@@ -444,10 +445,18 @@ def main():
                             
                             # Registo básico de vizinho
                             if sender_ip not in node.neighbors:
-                                node.neighbors[sender_ip] = {'metric': 50.0, 'last_seen': time.time(), 'state':'alive'}
-                            else:
-                                node.neighbors[sender_ip]['last_seen'] = time.time()
-                                node.neighbors[sender_ip]['state'] = 'alive'
+                                
+                                if sender_ip != args.tracker:
+
+                                    pass
+                                continue
+
+                            if node.neighbors[sender_ip]['state'] == 'dead':
+                                print(f"[{args.node_id}] 🧟 VIZINHO RESSUSCITOU: {sender_ip} voltou a falar!")
+
+                            node.neighbors[sender_ip]['last_seen'] = time.time()
+                            node.neighbors[sender_ip]['state'] = 'alive'
+                           
 
                             # 1. Tracker Messages (JSON)
                             try:
@@ -513,7 +522,17 @@ def main():
                                     sock.sendto(node.pack_message(MsgType.ACK_JOIN, sender_ip, ack_pl), (sender_ip, DEFAULT_PORT))
                                 if up and up!="SOURCE":
                                     sock.sendto(node.pack_message(MsgType.STREAM_JOIN, up, payload), (up, DEFAULT_PORT))
-                            
+                                if up is None:
+                                # Só entra em pânico se já passaram 2 segundos desde o último grito
+                                    if now - last_route_panic > 2.0:
+                                        print(f"[{args.node_id}] 🆘 Sem rota para atender JOIN! Pedindo rotas aos vizinhos...")
+                                        req = json.dumps({'cmd': 'route_request'}).encode('utf-8')
+                                        for n_ip, info in node.neighbors.items():
+                                            if n_ip != sender_ip and info.get('state') == 'alive':
+                                                sock.sendto(node.pack_message(MsgType.DEBUG, n_ip, req), (n_ip, DEFAULT_PORT))
+                                        last_route_panic = now
+
+
                             elif mtype == MsgType.ACK_JOIN:
                                 if join_state['active'] and sender_ip == join_state['target_ip']:
                                     join_state['active'] = False
@@ -554,6 +573,47 @@ def main():
                                     last_frame_received_time = time.time()
                                     ffplay_sink.write_data(base64.b64decode(info.get('data')))
                                     stats_frames_received += 1
+
+
+                            # ... (dentro do loop while do main.py) ...
+
+                            elif mtype == MsgType.ROUTE_REPLY:
+                                # O R3 recebe a resposta do R7 aqui!
+                                try:
+                                    # Descodifica a resposta (JSON com as rotas do vizinho)
+                                    reply_data = json.loads(payload.decode('utf-8'))
+                                    routes = reply_data.get('routes', {})
+                                    
+                                    # Custo do link para este vizinho
+                                    metric = node.neighbors.get(sender_ip, {}).get('metric', 50.0)
+                                    
+                                    updated_count = 0
+                                    
+                                    # Analisa as rotas que o vizinho mandou
+                                    for stream_id, r_info in routes.items():
+                                        cost_via_neighbor = r_info.get('cost', float('inf')) + metric
+                                        
+                                        # Se não temos rota OU esta rota é melhor, atualizamos!
+                                        if stream_id not in node.routing_table or cost_via_neighbor < node.routing_table[stream_id].custo_acumulado:
+                                            # IMPORTANTE: Importar RouteEntry se não estiver disponível
+                                            from overlay_structs import RouteEntry 
+                                            
+                                            node.routing_table[stream_id] = RouteEntry(stream_id, sender_ip, cost_via_neighbor)
+                                            node.routing_table[stream_id].last_update = time.time()
+                                            updated_count += 1
+                                            print(f"[{args.node_id}] 💡 Aprendi rota para {stream_id} via {sender_ip} (custo {cost_via_neighbor:.1f})")
+                                    
+                                except Exception as e:
+                                    print(f"Erro ao processar ROUTE_REPLY: {e}")
+
+                            elif mtype == MsgType.DEBUG:
+                                # Alguém (ex: R3) está a pedir-me as minhas rotas!
+                                resp = node.handle_debug(header, payload, sender_ip)
+                                
+                                # Se o handle_debug gerou uma resposta, tenho de a ENVIAR
+                                if resp:
+                                    print(f"[{args.node_id}] 🚑 Enviando socorro (rotas) para {sender_ip}")
+                                    sock.sendto(node.pack_message(MsgType.ROUTE_REPLY, sender_ip, resp), (sender_ip, DEFAULT_PORT))
                                     
                         except Exception: 
                             break

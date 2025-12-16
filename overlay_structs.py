@@ -361,13 +361,17 @@ class OverlayNode:
                 if prev_state != 'lost':
                     print(f"[{self.node_id}] ⚠️ Vizinho {n_ip} marcado como LOST")
             else:
-                self.neighbors[n_ip]['state'] = 'dead'
-                dead_neighbors.append(n_ip)
-                print(f"[{self.node_id}] ☠️ Vizinho {n_ip} considerado DEAD")
+                # Marcar como DEAD mas NÃO APAGAR do dicionário!
+                # Se apagarmos, o filtro rígido do main.py vai ignorar o vizinho quando ele reiniciar.
+                if prev_state != 'dead':
+                    self.neighbors[n_ip]['state'] = 'dead'
+                    dead_neighbors.append(n_ip)
+                    print(f"[{self.node_id}] ☠️ Vizinho {n_ip} considerado DEAD")
 
         if dead_neighbors:
             for dead_ip in dead_neighbors:
-                del self.neighbors[dead_ip]
+                # REMOVIDO: del self.neighbors[dead_ip]  <-- A LINHA ASSASSINA FOI REMOVIDA
+                
                 routes_removed = []
                 for stream_id, entry in list(self.routing_table.items()):
                     if entry.proximo_salto_ip == dead_ip:
@@ -382,6 +386,7 @@ class OverlayNode:
                             
                             ninfo = self.neighbors.get(sender)
                             
+                            # Só considerar candidatos que estejam ALIVE
                             if ninfo and ninfo.get('state') == 'alive':
                                 candidates.append((cost, sender, origin_seq, 0))
                             elif lsa_age < dead_threshold:
@@ -503,10 +508,12 @@ class OverlayNode:
         except: return None
 
         # DESCOBERTA DINÂMICA
+        #if sender_ip_real not in self.neighbors:
+            #print(f"[{self.node_id}] 🔍 Descoberto novo vizinho via FLOOD: {sender_ip_real}")
+            #self.neighbors[sender_ip_real] = {'metric': 50.0, 'last_seen': time.time(), 'state': 'alive', 'missed_hellos': 0}
         if sender_ip_real not in self.neighbors:
-            print(f"[{self.node_id}] 🔍 Descoberto novo vizinho via FLOOD: {sender_ip_real}")
-            self.neighbors[sender_ip_real] = {'metric': 50.0, 'last_seen': time.time(), 'state': 'alive', 'missed_hellos': 0}
-
+            return None
+    
         neighbor_info = self.neighbors.get(sender_ip_real, {})
         time_since_seen = time.time() - neighbor_info.get('last_seen', 0)
         if time_since_seen > 60.0: return None
@@ -597,6 +604,8 @@ class OverlayNode:
                 print(f"[{self.node_id}] >> Cliente adicionado: {sender_ip_real}")
             return entry.proximo_salto_ip, True, not was_first
         
+        print(f"[{self.node_id}] ⚠️ REJEITADO JOIN de {sender_ip_real} para {target_stream}: Sem Rota!")
+
         return None, False, False
 
     def handle_leave(self, payload, sender_ip_real):

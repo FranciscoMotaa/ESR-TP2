@@ -169,6 +169,28 @@ def main():
     
     node = OverlayNode(args.node_id, my_ip, DEFAULT_PORT)
     
+    # ===== CRIPTOGRAFIA AES-256-GCM (ATIVA POR PADRÃO) =====
+    encryption_passphrase = os.environ.get('STREAM_ENCRYPTION_KEY', 'default_secure_passphrase_2025')
+    enable_encryption = os.environ.get('ENABLE_ENCRYPTION', '1') == '1'
+    
+    print(f"[SECURITY] Configuração: ENABLE_ENCRYPTION={enable_encryption}, KEY={'personalizada' if 'STREAM_ENCRYPTION_KEY' in os.environ else 'padrão'}")
+    
+    if enable_encryption:
+        try:
+            node.security.enable(encryption_passphrase)
+            # Verificar se realmente está ativa
+            if not node.security.is_enabled():
+                print(f"[SECURITY] ❌ ERRO: Criptografia não foi ativada corretamente!")
+                sys.exit(1)
+            print(f"[SECURITY] ✅ Criptografia AES-256-GCM ATIVADA para {args.node_id}")
+            print(f"[SECURITY] 🔒 TODOS os pacotes serão cifrados!")
+        except Exception as e:
+            print(f"[SECURITY] ❌ ERRO ao ativar criptografia: {e}")
+            traceback.print_exc()
+            sys.exit(1)
+    else:
+        print(f"[SECURITY] ⚠️  Criptografia DESATIVADA (modo debug) - PACOTES EM CLARO!")
+    
     # Adicionar vizinhos iniciais
     for neighbor_ip in initial_neighbors:
         node.neighbors[neighbor_ip] = {'metric': 50.0, 'last_seen': time.time(), 'state': 'alive', 'missed_hellos': 0}
@@ -638,6 +660,11 @@ def main():
                             print(f"Rota {sid}: via {r.proximo_salto_ip} (custo {r.custo_acumulado:.1f}) Clientes: {r.downstream_ips}")
                         if join_state.get('stream_id'):
                             print(f"Stream Alvo: {join_state['stream_id']} | Pai: {join_state.get('parent_ip')} | Frames: {stats_frames_received}")
+                        # Estatísticas de segurança
+                        if node.security.is_enabled():
+                            print(f"🔒 Segurança: ATIVA | Enviados: {node.stats_encrypted_sent} | Recebidos: {node.stats_encrypted_recv} | Falhas: {node.stats_decrypt_failed}")
+                        else:
+                            print(f"🔓 Segurança: DESATIVADA (modo debug)")
                     
                     elif cmd.startswith("join"):
                         if "C" in args.node_id and ffplay_sink is None:

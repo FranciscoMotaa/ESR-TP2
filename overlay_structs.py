@@ -432,6 +432,13 @@ class OverlayNode:
             payload = iv + ciphertext + tag
             is_encrypted = 1
             self.stats_encrypted_sent += 1
+            # Debug: Primeiros 5 pacotes
+            if self.stats_encrypted_sent <= 5:
+                print(f"[SECURITY] 🔐 Pacote {self.stats_encrypted_sent} cifrado: {msg_type.name} -> {dest_ip} (payload: {len(payload)} bytes)")
+        elif encrypt and not self.security.is_enabled():
+            # AVISO: Tentou cifrar mas criptografia não está ativa!
+            if self.sequence_number <= 5:
+                print(f"[SECURITY] ⚠️  AVISO: pack_message chamado com encrypt=True mas criptografia NÃO ESTÁ ATIVA!")
         
         header = struct.pack(HEADER_FORMAT, msg_type.value, src_ip_bytes, dest_ip_bytes, 
                            self.sequence_number, timestamp, is_encrypted)
@@ -457,9 +464,16 @@ class OverlayNode:
                 return None, None
             payload = plaintext
             self.stats_encrypted_recv += 1
+            # Debug: Primeiros 5 pacotes
+            if self.stats_encrypted_recv <= 5:
+                print(f"[SECURITY] 🔓 Pacote {self.stats_encrypted_recv} decifrado com sucesso (payload: {len(payload)} bytes)")
         elif is_encrypted == 1 and not self.security.is_enabled():
-            print(f"[SECURITY] Pacote cifrado recebido mas criptografia não está ativa!")
+            print(f"[SECURITY] ❌ Pacote cifrado recebido mas criptografia não está ativa!")
             return None, None
+        elif is_encrypted == 0 and self.security.is_enabled():
+            # Recebemos pacote EM CLARO mas esperávamos cifrado
+            if seq <= 5:
+                print(f"[SECURITY] ⚠️  AVISO: Pacote EM CLARO recebido (expected encrypted)! Tipo: {msg_type_val}")
         
         try:
             msg_type_enum = MsgType(msg_type_val)

@@ -21,7 +21,7 @@ VIDEO_SOURCE = "trailer_the_boys.mp4"
 RETRY_WAIT_INTERVAL = 5.0
 
 # --- CONFIGURAÇÃO REDE ---
-CHUNK_SIZE = 700  # Tamanho seguro para evitar fragmentação
+CHUNK_SIZE = 500  # Tamanho seguro para evitar fragmentação
 
 # --- FUNÇÃO CRÍTICA PARA A ÁRVORE ---
 def get_all_ips():
@@ -124,6 +124,16 @@ class FFplayPlayer:
             self.process.stdin.flush()
         except (BrokenPipeError, IOError):
             print("[PLAYER] Aviso: Pipe quebrado (Janela fechada?).")
+            self.process = None
+
+    def close(self):
+        if self.process:
+            print("[PLAYER] A fechar janela de vídeo...")
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=1) # Espera que feche
+            except: 
+                pass
             self.process = None
 
 def get_neighbors_dynamic(tracker_ip, my_id, my_ip):
@@ -630,6 +640,9 @@ def main():
                             print(f"Stream Alvo: {join_state['stream_id']} | Pai: {join_state.get('parent_ip')} | Frames: {stats_frames_received}")
                     
                     elif cmd.startswith("join"):
+                        if "C" in args.node_id and ffplay_sink is None:
+                            ffplay_sink = FFplayPlayer(title=args.node_id)
+                        
                         parts = cmd.split()
                         if len(parts) > 1:
                             tgt = parts[1]
@@ -643,6 +656,44 @@ def main():
                                 print("[!] Rota desconhecida. Aguarde flood.")
                         else:
                             print("Rotas disponíveis:", list(node.routing_table.keys()))
+
+
+                    elif cmd.startswith("leave"):
+                        parts = cmd.split()
+                        # Se o utilizador não disser qual, assumimos o atual
+                        sid_to_leave = parts[1] if len(parts) > 1 else join_state.get('stream_id')
+                        
+                        if not sid_to_leave:
+                            print("Uso: leave <stream_id>")
+                            continue
+
+                        # Verificar se estamos a tentar sair do stream correto
+                        if join_state.get('stream_id') == sid_to_leave:
+                            print(f"[{args.node_id}] 👋 A sair do stream {sid_to_leave}...")
+                            
+                            # 1. Avisar o pai (se tivermos um)
+                            parent = join_state.get('parent_ip')
+                            if parent:
+                                pl = json.dumps({"stream_id": sid_to_leave}).encode('utf-8')
+                                # Envia STREAM_LEAVE para o pai
+                                sock.sendto(node.pack_message(MsgType.STREAM_LEAVE, parent, pl), (parent, DEFAULT_PORT))
+                            
+                            # 2. Limpar o estado local
+                            join_state['active'] = False
+                            join_state['stream_id'] = None
+                            join_state['target_ip'] = None
+                            join_state['parent_ip'] = None
+                            join_state['retries'] = 0
+                            
+                            # Parar o player visual se estiver a correr
+                            if ffplay_sink:
+                                ffplay_sink.close() # Fecha a janela visual
+                                ffplay_sink = None  # Apaga o objeto para recriar depois
+                            
+                            print(f"[{args.node_id}] ✅ Desconectado e janela fechada.")
+
+                        else:
+                            print(f"[{args.node_id}] ⚠️ Não estás conectado ao stream '{sid_to_leave}'.")
 
     except KeyboardInterrupt: print("\nBye.")
     finally:
